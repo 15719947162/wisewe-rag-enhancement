@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WiseWe RAG Console UI Preview</title>
+  <style>
+    :root {
+      --canvas: #f5f7fb;
+      --panel: #ffffff;
+      --ink: #111827;
+      --muted: #566274;
+      --soft: #8a95a8;
+      --border: #dde3f0;
+      --brand: #365dff;
+      --cyan: #06b6d4;
+      --teal: #00a889;
+      --mint: #10b981;
+      --violet: #7c3aed;
+      --pink: #ec4899;
+      --amber: #ff8a00;
+      --yellow: #facc15;
+      --rose: #e11d48;
+      --sky: #0ea5e9;
+      --indigo: #4f46e5;
+      --orange-red: #f97316;
+      --shadow: 0 18px 45px rgba(36, 48, 86, .10), 0 4px 12px rgba(36, 48, 86, .05);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", Arial, sans-serif;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, rgba(54, 93, 255, .045) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(6, 182, 212, .035) 1px, transparent 1px),
+        radial-gradient(circle at 12% 8%, rgba(54, 93, 255, .16), transparent 28%),
+        radial-gradient(circle at 86% 4%, rgba(255, 138, 0, .16), transparent 24%),
+        radial-gradient(circle at 76% 78%, rgba(236, 72, 153, .12), transparent 28%),
+        radial-gradient(circle at 18% 88%, rgba(0, 168, 137, .12), transparent 24%),
+        var(--canvas);
+      background-size: 34px 34px, 34px 34px, auto, auto, auto, auto;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 286px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      border-right: 1px solid rgba(221, 227, 240, .9);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.92), rgba(249,251,255,.84)),
+        radial-gradient(circle at 12% 0%, rgba(54,93,255,.14), transparent 28%),
+        radial-gradient(circle at 92% 18%, rgba(236,72,153,.10), transparent 24%);
+      backdrop-filter: blur(18px);
+      padding: 18px 14px;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .sidebar:before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: linear-gradient(180deg, rgba(54, 93, 255, .18), rgba(0, 168, 137, .12), transparent);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 10px 20px;
+    }
+
+    .logo {
+      width: 42px;
+      height: 42px;
+      border-radius: 8px;
+      background: conic-gradient(from 130deg, var(--brand), var(--cyan), var(--pink), var(--amber), var(--brand));
+      box-shadow: 0 14px 32px rgba(54, 93, 255, .28);
+      display: grid;
+      place-items: center;
+      color: white;
+      font-weight: 800;
+    }
+
+    .brand strong { display: block; font-size: 15px; }
+    .brand span { display: block; margin-top: 2px; color: var(--soft); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+
+    .identity {
+      display: none;
+    }
+
+    .nav-title,
+    .eyebrow {
+      color: var(--soft);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .nav-group {
+      margin: 12px 0;
+      padding: 4px 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .nav-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 5px 8px;
+    }
+
+    .nav-title:before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--brand), var(--cyan));
+      box-shadow: 0 0 0 4px rgba(54, 93, 255, .08);
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 10px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+      margin: 3px 0;
+      position: relative;
+      transition: background .18s ease, color .18s ease, box-shadow .18s ease;
+    }
+
+    .nav-item.active {
+      color: var(--brand);
+      background:
+        linear-gradient(90deg, rgba(54, 93, 255, .16), rgba(6, 182, 212, .08)),
+        rgba(255,255,255,.80);
+      box-shadow: inset 3px 0 0 var(--brand), 0 10px 22px rgba(54, 93, 255, .10);
+    }
+
+    .nav-item.active:after {
+      content: "";
+      margin-left: auto;
+      width: 6px;
+      height: 18px;
+      border-radius: 999px;
+      background: linear-gradient(180deg, var(--brand), var(--cyan));
+      box-shadow: 0 0 14px rgba(54, 93, 255, .30);
+    }
+
+    .nav-item:hover {
+      color: var(--ink);
+      background: rgba(255,255,255,.78);
+    }
+
+    .dot {
+      width: 24px;
+      height: 24px;
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--tone) 88%, white), color-mix(in srgb, var(--tone) 46%, white));
+      box-shadow: 0 8px 16px color-mix(in srgb, var(--tone) 18%, transparent);
+      position: relative;
+      flex: 0 0 auto;
+    }
+
+    .dot:after {
+      content: "";
+      position: absolute;
+      inset: 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.92);
+    }
+
+    main { min-width: 0; }
+
+    .topbar {
+      height: 76px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 0 30px;
+      border-bottom: 1px solid rgba(221, 227, 240, .9);
+      background: rgba(250, 251, 255, .80);
+      backdrop-filter: blur(16px);
+      position: sticky;
+      top: 0;
+      z-index: 4;
+    }
+
+    .crumb { font-size: 13px; color: var(--soft); }
+    .crumb strong { color: var(--ink); }
+
+    .search {
+      margin-left: auto;
+      width: min(430px, 34vw);
+      height: 38px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: white;
+      color: var(--soft);
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      font-size: 13px;
+    }
+
+    .button {
+      height: 38px;
+      border-radius: 8px;
+      border: 0;
+      padding: 0 14px;
+      background: linear-gradient(135deg, var(--brand), var(--violet));
+      color: white;
+      font-weight: 700;
+      box-shadow: 0 12px 24px rgba(54, 93, 255, .20);
+    }
+
+    .content {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 28px 30px 44px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(320px, .9fr);
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .hero-main {
+      border: 1px solid color-mix(in srgb, var(--brand) 20%, var(--border));
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, rgba(54, 93, 255, .17), rgba(6, 182, 212, .10) 34%, rgba(0, 168, 137, .08)),
+        linear-gradient(180deg, rgba(255,255,255,.95), rgba(255,255,255,.82));
+      padding: 24px;
+      box-shadow: var(--shadow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-main:after {
+      content: "";
+      position: absolute;
+      right: -80px;
+      top: -110px;
+      width: 320px;
+      height: 320px;
+      background: conic-gradient(from 120deg, rgba(54,93,255,.34), rgba(6,182,212,.30), rgba(236,72,153,.24), rgba(255,138,0,.24), rgba(54,93,255,.34));
+      border-radius: 50%;
+      filter: blur(18px);
+      opacity: .78;
+    }
+
+    .hero-main > * { position: relative; z-index: 1; }
+    h1 { margin: 10px 0 8px; font-size: 34px; line-height: 1.12; letter-spacing: 0; }
+    .lead { max-width: 760px; margin: 0; color: var(--muted); line-height: 1.7; font-size: 14px; }
+
+    .quick-grid {
+      margin-top: 22px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .quick {
+      min-height: 96px;
+      border: 1px solid color-mix(in srgb, var(--tone) 26%, var(--border));
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--tone) 20%, white), rgba(255, 255, 255, .88)),
+        white;
+      padding: 13px;
+      box-shadow: 0 12px 28px color-mix(in srgb, var(--tone) 12%, transparent);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .quick:after {
+      content: "";
+      position: absolute;
+      right: -24px;
+      bottom: -30px;
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--tone) 24%, transparent);
+    }
+
+    .quick b { display: block; margin-top: 12px; font-size: 13px; }
+    .quick span { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+
+    .panel {
+      border: 1px solid color-mix(in srgb, var(--tone, var(--brand)) 20%, var(--border));
+      border-radius: 8px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--tone, var(--brand)) 10%, white), rgba(255, 255, 255, .94)),
+        rgba(255, 255, 255, .90);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .health { padding: 18px; --tone: var(--sky); }
+    .health h2, .card h2 { margin: 0; font-size: 16px; }
+
+    .health-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 13px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+
+    .health-row:last-child { border-bottom: 0; }
+    .status { font-weight: 800; color: var(--tone); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .metric {
+      border: 1px solid color-mix(in srgb, var(--tone) 26%, var(--border));
+      border-radius: 8px;
+      background:
+        radial-gradient(circle at 100% 100%, color-mix(in srgb, var(--tone) 20%, transparent), transparent 34%),
+        linear-gradient(135deg, color-mix(in srgb, var(--tone) 11%, white), white 62%);
+      padding: 17px;
+      position: relative;
+      overflow: hidden;
+      min-height: 128px;
+      box-shadow: 0 12px 30px color-mix(in srgb, var(--tone) 13%, transparent);
+    }
+
+    .metric:after {
+      content: "";
+      position: absolute;
+      right: -28px;
+      bottom: -34px;
+      width: 96px;
+      height: 96px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--tone) 16%, transparent);
+    }
+
+    .metric small { color: var(--soft); font-size: 11px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
+    .metric strong { display: block; margin-top: 16px; font-family: "JetBrains Mono", "Fira Code", monospace; font-size: 32px; }
+    .metric span { color: var(--muted); font-size: 12px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(360px, .75fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .card-head {
+      min-height: 58px;
+      padding: 16px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid color-mix(in srgb, var(--tone, var(--brand)) 16%, var(--border));
+      background: linear-gradient(90deg, color-mix(in srgb, var(--tone, var(--brand)) 12%, white), rgba(255,255,255,.76));
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 26px;
+      border-radius: 999px;
+      padding: 0 10px;
+      background: color-mix(in srgb, var(--tone) 14%, white);
+      color: var(--tone);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .task {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(90deg, color-mix(in srgb, var(--task-tone, var(--amber)) 8%, white), white 48%);
+    }
+
+    .task:last-child { border-bottom: 0; }
+    .task-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .task-title b { font-size: 14px; }
+    .task-title span { color: var(--soft); font-family: "JetBrains Mono", monospace; font-size: 12px; }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 6px;
+      margin-top: 13px;
+    }
+
+    .stage {
+      height: 7px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--tone) 24%, #e8edf7);
+      overflow: hidden;
+    }
+
+    .stage.done { background: var(--tone); }
+    .stage.active {
+      background: linear-gradient(90deg, var(--tone), color-mix(in srgb, var(--tone) 35%, white), var(--tone));
+      background-size: 200% 100%;
+      animation: pulse 1.8s infinite linear;
+    }
+
+    @keyframes pulse { to { background-position: -200% 0; } }
+
+    .task-meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+      color: var(--soft);
+      font-size: 12px;
+    }
+
+    .task-meta span {
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--task-tone, var(--amber)) 11%, white);
+      color: color-mix(in srgb, var(--task-tone, var(--amber)) 82%, #111827);
+      font-weight: 700;
+    }
+
+    .alert {
+      display: grid;
+      grid-template-columns: 4px minmax(0,1fr);
+      gap: 13px;
+      padding: 15px 18px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(90deg, color-mix(in srgb, var(--tone) 12%, white), white 56%);
+    }
+
+    .alert:last-child { border-bottom: 0; }
+    .bar { border-radius: 999px; background: var(--tone); }
+    .alert b { font-size: 13px; }
+    .alert p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+
+    .domain-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .domain {
+      min-height: 138px;
+      border: 1px solid color-mix(in srgb, var(--tone) 28%, var(--border));
+      border-radius: 8px;
+      background:
+        radial-gradient(circle at 90% 8%, color-mix(in srgb, var(--tone) 22%, transparent), transparent 34%),
+        linear-gradient(145deg, color-mix(in srgb, var(--tone) 14%, white), white 60%);
+      padding: 14px;
+      box-shadow: 0 12px 28px color-mix(in srgb, var(--tone) 13%, transparent);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .domain:after {
+      content: "";
+      position: absolute;
+      inset: auto 12px 12px auto;
+      width: 42px;
+      height: 6px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--tone), color-mix(in srgb, var(--tone) 30%, white));
+    }
+
+    .domain .icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--tone), color-mix(in srgb, var(--tone) 48%, white));
+      display: grid;
+      place-items: center;
+      color: white;
+      font-weight: 900;
+      box-shadow: 0 10px 20px color-mix(in srgb, var(--tone) 22%, transparent);
+    }
+
+    .domain b { display: block; margin-top: 14px; font-size: 13px; }
+    .domain p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+
+    @media (max-width: 1100px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .hero, .grid { grid-template-columns: 1fr; }
+      .quick-grid, .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .domain-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .search { display: none; }
+    }
+
+    @media print {
+      body { background: white; }
+      .app { grid-template-columns: 240px 1fr; }
+      .topbar { position: static; }
+      .sidebar { position: static; height: auto; }
+      .button, .search { display: none; }
+      .content { padding: 18px; }
+      .panel, .metric, .domain, .hero-main { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">W</div>
+        <div>
+          <strong>WiseWe RAG</strong>
+          <span>Knowledge Console</span>
+        </div>
+      </div>
+
+      <div class="identity">
+        <small>当前身份</small>
+        <p>系统管理员</p>
+        <span>AI 基座租户 / superManager</span>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-title">指挥台</div>
+        <div class="nav-item active"><i class="dot" style="--tone: var(--brand)"></i>系统总览</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--cyan)"></i>身份与访问</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">知识资产</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--teal)"></i>知识库</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--mint)"></i>文档与图谱</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">生产与验证</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--amber)"></i>入库生产线</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--violet)"></i>问答验证台</div>
+      </div>
+      <div class="nav-group">
+        <div class="nav-title">治理观测</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--sky)"></i>开放接口</div>
+        <div class="nav-item"><i class="dot" style="--tone: var(--pink)"></i>日志与用量</div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div class="crumb">WiseWe / <strong>系统总览</strong></div>
+        <div class="search">搜索知识库、requestId、API Key、任务...</div>
+        <button class="button">新建知识库</button>
+      </header>
+
+      <section class="content">
+        <div class="hero">
+          <div class="hero-main">
+            <div class="eyebrow">Command Center</div>
+            <h1>教材知识库全链路控制台</h1>
+            <p class="lead">把文档解析、入库生产线、RAG 验证、OpenAPI 治理和日志用量收拢到一个产品化工作台。第一屏直接回答：系统是否健康、任务卡在哪里、风险是什么、下一步该处理什么。</p>
+
+            <div class="quick-grid">
+              <div class="quick" style="--tone: var(--teal)"><i class="dot"></i><b>知识资产</b><span>文档、切片、图谱、证据统一管理</span></div>
+              <div class="quick" style="--tone: var(--amber)"><i class="dot"></i><b>入库生产线</b><span>解析、增强、向量化阶段可观测</span></div>
+              <div class="quick" style="--tone: var(--violet)"><i class="dot"></i><b>问答验证</b><span>召回、引用、评分和拒答归因</span></div>
+              <div class="quick" style="--tone: var(--pink)"><i class="dot"></i><b>审计用量</b><span>requestId、Token、延迟、导出闭环</span></div>
+            </div>
+          </div>
+
+          <div class="panel health">
+            <h2>系统健康</h2>
+            <div class="health-row"><span>后端服务</span><b class="status" style="--tone: var(--teal)">正常</b></div>
+            <div class="health-row"><span>解析 Provider</span><b class="status" style="--tone: var(--amber)">可观测</b></div>
+            <div class="health-row"><span>向量库</span><b class="status" style="--tone: var(--teal)">在线</b></div>
+            <div class="health-row"><span>治理能力</span><b class="status" style="--tone: var(--sky)">部分完成</b></div>
+          </div>
+        </div>
+
+        <div class="metrics">
+          <div class="metric" style="--tone: var(--teal)"><small>知识库</small><strong>18</strong><span>3 个本周更新</span></div>
+          <div class="metric" style="--tone: var(--amber)"><small>文档</small><strong>1,284</strong><span>今日新增 42 篇</span></div>
+          <div class="metric" style="--tone: var(--violet)"><small>切片</small><strong>486k</strong><span>Graph 关系 72k</span></div>
+          <div class="metric" style="--tone: var(--rose)"><small>今日请求</small><strong>9,602</strong><span>失败率 0.8%</span></div>
+        </div>
+
+        <div class="grid">
+          <section class="panel card" style="--tone: var(--amber)">
+            <div class="card-head">
+              <h2>入库生产线</h2>
+              <span class="pill" style="--tone: var(--amber)">4 个运行中</span>
+            </div>
+            <div class="task" style="--task-tone: var(--amber)">
+              <div class="task-title"><b>中医学教材 2026 版.pdf</b><span>task / 7f07b8</span></div>
+              <div class="pipeline" style="--tone: var(--amber)">
+                <i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage active"></i><i class="stage"></i><i class="stage"></i><i class="stage"></i>
+              </div>
+              <div class="task-meta"><span>Document Mind</span><span>396 pages</span><span>chunk 42%</span><span>basic-ready 可检索</span></div>
+            </div>
+            <div class="task" style="--task-tone: var(--teal)">
+              <div class="task-title"><b>神经病学图表汇编.pdf</b><span>task / bc79f5</span></div>
+              <div class="pipeline" style="--tone: var(--teal)">
+                <i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage active"></i><i class="stage"></i>
+              </div>
+              <div class="task-meta"><span>MinerU Official</span><span>embedding 68%</span><span>0 throttle</span><span>预计 2m</span></div>
+            </div>
+            <div class="task" style="--task-tone: var(--sky)">
+              <div class="task-title"><b>开放接口联调知识库</b><span>task / 260621</span></div>
+              <div class="pipeline" style="--tone: var(--sky)">
+                <i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage done"></i><i class="stage done"></i>
+              </div>
+              <div class="task-meta"><span>success</span><span>requestId 已写入日志</span><span>OpenAPI 可调用</span></div>
+            </div>
+          </section>
+
+          <section class="panel card" style="--tone: var(--rose)">
+            <div class="card-head">
+              <h2>风险与待办</h2>
+              <span class="pill" style="--tone: var(--rose)">治理增强</span>
+            </div>
+            <div class="alert" style="--tone: var(--rose)"><i class="bar"></i><div><b>正式 SSO exchange 仍在延后</b><p>当前已具备身份快照和请求头身份底座，正式 session / JWT 仍需后续接入。</p></div></div>
+            <div class="alert" style="--tone: var(--amber)"><i class="bar"></i><div><b>API Key 强签名未完成</b><p>Bearer / X-API-Key 已可用，HMAC、timestamp、nonce、IP 白名单需进入硬化阶段。</p></div></div>
+            <div class="alert" style="--tone: var(--sky)"><i class="bar"></i><div><b>日志中心建议扩展审计维度</b><p>当前可导出脱敏字段，后续补充完整审计日志和 24 小时导出文件清理。</p></div></div>
+          </section>
+        </div>
+
+        <div class="domain-grid">
+          <div class="domain" style="--tone: var(--brand)"><div class="icon">01</div><b>指挥台</b><p>总览、健康、队列和告警入口。</p></div>
+          <div class="domain" style="--tone: var(--teal)"><div class="icon">02</div><b>知识资产</b><p>知识库、文档、图谱和证据。</p></div>
+          <div class="domain" style="--tone: var(--amber)"><div class="icon">03</div><b>入库生产线</b><p>解析、增强、向量化全链路。</p></div>
+          <div class="domain" style="--tone: var(--violet)"><div class="icon">04</div><b>问答验证</b><p>RAG、Graph RAG、评测闭环。</p></div>
+          <div class="domain" style="--tone: var(--sky)"><div class="icon">05</div><b>开放治理</b><p>身份、API Key、OpenAPI。</p></div>
+          <div class="domain" style="--tone: var(--pink)"><div class="icon">06</div><b>观测审计</b><p>日志、用量、Token 和导出。</p></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
