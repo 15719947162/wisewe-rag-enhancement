@@ -1,0 +1,5 @@
+{
+  "pythonVersion": "3.11",
+  "include": ["backend", "core", "tests", "main.py"],
+  "extraPaths": ["."]
+}

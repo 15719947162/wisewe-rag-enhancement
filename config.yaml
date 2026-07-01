@@ -1,0 +1,32 @@
+parser:
+  mode: cloud  # 仅支持 302.ai MinerU 云端解析
+  cloud:
+    parse_method: "auto"  # ocr / txt / auto
+    version: "2.5"        # 2.0 / 2.5
+    timeout: 1800         # 轮询超时（秒）
+    poll_interval: 3      # 起始轮询间隔（秒），指数退避至 15s
+    sharding:
+      enabled: true       # 大文件自动拆分为多个 MinerU 云端任务
+      min_pages: 120      # 页数达到该阈值时允许分片
+      min_file_mb: 80     # 文件大小达到该阈值时允许分片
+      pages_per_shard: 20 # 每个 shard 页数
+      max_concurrency: 4  # 并发 shard 数，避免触发云端限流
+      text_sample_pages: 5 # PDF 体检时采样前 N 页文本层
+  oss:
+    prefix: "mineru-uploads"  # 上传路径前缀
+    url_expiry: 3600          # 签名 URL 有效期（秒）
+
+embedding:
+  base_url: ""          # 留空则读 LLM_BASE_URL 环境变量
+  api_key: ""           # 留空则读 LLM_API_KEY 环境变量
+  model: ""             # 留空则读 LLM_EMBEDDING_MODEL，默认 text-embedding-v3
+  dimensions: 1024
+  batch_size: 20
+
+output:
+  dir: data/output
+  encoding: utf-8-sig
+
+pgvector:
+  enabled: false            # 设为 true 启用 pgvector 写入（需数据库可用）
+  default_kb_id: "default"  # 默认知识库 ID（未指定时使用）

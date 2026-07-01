@@ -1,0 +1,32 @@
+ARG PYTHON_IMAGE=m.daocloud.io/docker.io/library/python:3.11-slim
+FROM ${PYTHON_IMAGE}
+
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
+
+WORKDIR /app
+
+COPY requirements.txt ./
+
+RUN mkdir -p /app/.pip-tmp \
+    && TMPDIR=/app/.pip-tmp python -m pip install --no-cache-dir -r requirements.txt \
+    && rm -rf /app/.pip-tmp
+
+COPY backend ./backend
+COPY core ./core
+COPY data ./data
+COPY config.yaml ./config.yaml
+COPY main.py ./main.py
+
+RUN mkdir -p /app/data/input /app/data/output
+
+EXPOSE 8000
+
+CMD ["python", "-m", "backend.serve", "--host", "0.0.0.0", "--port", "8000"]

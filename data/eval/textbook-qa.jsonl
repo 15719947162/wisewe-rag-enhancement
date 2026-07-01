@@ -1,0 +1,2 @@
+{"id":"q001","kb_id":"default","query":"什么是应急预案？","intent":"concept","ground_truth_chunks":["chunk-demo-1"],"ground_truth_answer":"应急预案是针对突发事件的事前准备与响应安排。","cross_section":false,"tags":["应急管理","概念"],"notes":"示例数据，需要替换为真实 chunk id。"}
+{"id":"q002","kb_id":"default","query":"应急预案如何编制？","intent":"procedure","ground_truth_chunks":["chunk-demo-2","chunk-demo-3"],"ground_truth_answer":"应急预案编制通常包括风险识别、职责分工、响应流程和演练复盘。","cross_section":true,"tags":["应急管理","流程"],"notes":"示例数据，需要替换为真实 chunk id。"}

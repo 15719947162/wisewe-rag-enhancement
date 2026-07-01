@@ -1,0 +1,133 @@
+services:
+  redis:
+    image: ${REDIS_IMAGE:-m.daocloud.io/docker.io/library/redis:7-alpine}
+    container_name: wisewe-rag-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-m.daocloud.io/docker.io/library/python:3.11-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.aliyun.com}
+    container_name: wisewe-rag-db-init
+    profiles:
+      - tools
+    env_file:
+      - .env
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "core.db.init_db"]
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-m.daocloud.io/docker.io/library/python:3.11-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.aliyun.com}
+    container_name: wisewe-rag-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: ""
+    ports:
+      - "${BACKEND_HOST_PORT:-8001}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health').read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-m.daocloud.io/docker.io/library/node:22-alpine}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://192.168.2.208:8001}
+    container_name: wisewe-rag-frontend
+    restart: unless-stopped
+    environment:
+      INTERNAL_API_BASE_URL: http://backend:8000
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://192.168.2.208:8001}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-m.daocloud.io/docker.io/library/python:3.11-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.aliyun.com}
+    container_name: wisewe-rag-cli
+    profiles:
+      - tools
+    env_file:
+      - .env
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: ""
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: ["python", "-m", "backend.cli"]
+    command: ["--help"]
+
+volumes:
+  redis_data:

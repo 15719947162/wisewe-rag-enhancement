@@ -1,0 +1,2312 @@
+<html><head><link rel="stylesheet" type="text/css" href="https://unpkg.com/vditor@3.11.0/dist/index.css"/>
+<script src="https://unpkg.com/vditor@3.11.0/dist/js/i18n/zh_CN.js"></script>
+<script src="https://unpkg.com/vditor@3.11.0/dist/method.min.js"></script></head>
+<body><div class="vditor-reset" id="preview"><p><strong>You:</strong></p>
+<p>我想调研一下，国内外有哪些embedding的服务，我主要希望把医学教材embedding成向量数据库给agent做rag的，请帮我看看有哪些服务，价格如何，最贵的最好的是什么</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<p>我会按“可商用API服务、中文/医学教材适配、价格、RAG效果、合规部署”几个维度梳理，并优先用官方价格页做依据。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<p>我先给出一个判断：医学教材 RAG 不应只比 embedding 单价，真正影响效果的是“分块策略 + hybrid 检索 + rerank + 元数据权限 + 引文定位”。Embedding 只负责第一层召回，不能单独决定医学问答质量。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<h2>结论先行</h2>
+<p>用于“医学教材 → 向量数据库 → Agent RAG”，我建议不要直接追求“最贵”，而是采用 <strong>“国产主力 embedding + 国际高端模型抽样评测 + reranker 重排”</strong> 的组合路线。</p>
+<p>我的建议排序：</p>
+<ol>
+<li><strong>国内主力方案：阿里百炼 <code>text-embedding-v4</code> / Qwen3-Embedding 系列</strong><br />
+适合作为医学教材中文 RAG 的第一候选。价格约 <strong>$0.07–0.072 / 百万 token</strong>，支持 64–2048 多种维度、8192 token 输入，属于 Qwen3-Embedding 系列，支持 100+ 语言。<a href="https://www.alibabacloud.com/help/zh/model-studio/text-embedding-synchronous-api?utm_source=chatgpt.com">Alibaba Cloud+1</a></li>
+<li><strong>国内低成本备选：智谱 <code>Embedding-3</code></strong><br />
+价格 <strong>0.5 元 / 百万 token</strong>，支持 256–2048 维，8K 上下文，官方明确推荐用于高精度语义搜索、知识库、专业领域知识检索。<a href="https://docs.bigmodel.cn/cn/guide/models/embedding/embedding-3?utm_source=chatgpt.com">智谱AI开放文档+1</a></li>
+<li><strong>国际高质量对标：OpenAI <code>text-embedding-3-large</code>、Voyage <code>voyage-4-large</code>、Google Gemini Embedding、Cohere Embed v4</strong><br />
+OpenAI <code>text-embedding-3-large</code> 是 <strong>$0.13 / 百万 token</strong>，<code>text-embedding-3-small</code> 是 <strong>$0.02 / 百万 token</strong>；Voyage <code>voyage-4-large</code> 是 <strong>$0.12 / 百万 token</strong>，<code>voyage-context-3</code> 更贵，为 <strong>$0.18 / 百万 token</strong>；Google Gemini Embedding 在线请求是 <strong>$0.15 / 百万 token</strong>，Gemini Embedding 2 文本输入是 <strong>$0.20 / 百万 token</strong>。<a href="https://platform.openai.com/docs/pricing/?utm_source=chatgpt.com">OpenAI平台+2Voyage AI+2</a></li>
+<li><strong>“最贵”不等于“最好”</strong><br />
+按公开单价看，文本 embedding 中比较贵的是 <strong>Google Gemini Embedding 2：$0.20 / 百万 token</strong>，其次是 Voyage <code>voyage-context-3</code>：<strong>$0.18 / 百万 token</strong>，Mistral <code>Codestral Embed</code> 是 <strong>$0.15 / 百万 token</strong>但主要面向代码检索，不适合医学教材主场景。<a href="https://cloud.google.com/vertex-ai/generative-ai/pricing?linkId=26729974">Google Cloud+2Voyage AI+2</a><br />
+但医学教材 RAG 的实际效果，必须用你自己的教材、题库、病例、知识点问答集做召回率评测。MTEB 论文也明确指出，不存在一个 embedding 方法在所有任务上都绝对统治。<a href="https://arxiv.org/abs/2210.07316?utm_source=chatgpt.com">arXiv</a></li>
+</ol>
+<hr />
+<h2>主流 embedding 服务清单</h2>
+<table>
+<thead>
+<tr>
+<th>服务</th>
+<th>推荐模型</th>
+<th>公开价格</th>
+<th>适合度</th>
+<th>我的判断</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>阿里云百炼 / DashScope</strong></td>
+<td><code>text-embedding-v4</code></td>
+<td>约 <strong>$0.07–0.072 / 百万 token</strong></td>
+<td>中文教材、医学教育、国内部署</td>
+<td><strong>最适合先做主力模型</strong></td>
+</tr>
+<tr>
+<td><strong>智谱 AI</strong></td>
+<td><code>Embedding-3</code></td>
+<td><strong>0.5 元 / 百万 token</strong></td>
+<td>中文知识库、专业领域检索</td>
+<td><strong>性价比高，适合备选评测</strong></td>
+</tr>
+<tr>
+<td><strong>OpenAI</strong></td>
+<td><code>text-embedding-3-small / large</code></td>
+<td>small <strong>$0.02</strong>，large <strong>$0.13 / 百万 token</strong></td>
+<td>国际通用、生态成熟</td>
+<td><strong>适合作国际基准线</strong></td>
+</tr>
+<tr>
+<td><strong>Voyage AI</strong></td>
+<td><code>voyage-4-large / voyage-4 / voyage-4-lite</code></td>
+<td>large <strong>$0.12</strong>，标准 <strong>$0.06</strong>，lite <strong>$0.02 / 百万 token</strong></td>
+<td>高质量 RAG、多语言、长文档</td>
+<td><strong>高端 RAG 候选</strong></td>
+</tr>
+<tr>
+<td><strong>Google</strong></td>
+<td>Gemini Embedding / Gemini Embedding 2</td>
+<td>Gemini Embedding <strong>$0.15 / 百万 token</strong>；Embedding 2 文本 <strong>$0.20 / 百万 token</strong></td>
+<td>多模态、Google Cloud 生态</td>
+<td><strong>价格偏高，适合高端对标</strong></td>
+</tr>
+<tr>
+<td><strong>Cohere</strong></td>
+<td><code>embed-v4.0</code></td>
+<td>聚合价格显示约 <strong>$0.12 / 百万 token</strong>；也支持私有 Model Vault 月费</td>
+<td>多模态、PDF、128K 长上下文</td>
+<td><strong>企业级文档 RAG 候选</strong></td>
+</tr>
+<tr>
+<td><strong>火山引擎 VikingDB / 豆包 embedding</strong></td>
+<td><code>doubao-embedding-large</code>、<code>bge-m3</code></td>
+<td>公开文档主要展示能力与限流，价格需控制台或商务确认</td>
+<td>国内向量数据库一体化</td>
+<td><strong>适合端到端托管方案</strong></td>
+</tr>
+<tr>
+<td><strong>腾讯云 VectorDB</strong></td>
+<td>内置 Embedding + AI 套件</td>
+<td>向量数据库实例从约 <strong>344 元/月</strong> 起</td>
+<td>文档入库、检索、向量库一体化</td>
+<td><strong>适合快速搭建知识库原型</strong></td>
+</tr>
+<tr>
+<td><strong>Jina AI</strong></td>
+<td><code>jina-embeddings-v5-text</code>、<code>jina-embeddings-v4</code></td>
+<td>官网显示 token 计费和 1000 万 token 免费试用，具体单价需账户页确认</td>
+<td>多语言、多模态、长文档</td>
+<td><strong>适合做国际先进模型评测</strong></td>
+</tr>
+<tr>
+<td><strong>AWS Bedrock</strong></td>
+<td>Titan Text Embeddings V2</td>
+<td>官方模型支持 8192 token、1024/512/256 维；价格需按区域价格页确认</td>
+<td>AWS 生态、合规云部署</td>
+<td><strong>适合已有 AWS 架构的客户</strong></td>
+</tr>
+</tbody>
+</table>
+<p>阿里百炼文档明确推荐 <code>text-embedding-v4</code> 作为纯文本或代码处理的首选，并支持任务指令、稀疏向量等能力，这对医学教材 RAG 很关键，因为医学教材检索经常需要“按任务意图”区分概念解释、鉴别诊断、操作流程、考试题干等不同场景。<a href="https://www.alibabacloud.com/help/zh/model-studio/embedding?utm_source=chatgpt.com">Alibaba Cloud</a></p>
+<p>火山 VikingDB 文档显示，其 embedding 能力支持 <code>bge-large-zh</code>、<code>bge-m3</code>、<code>doubao-embedding</code>、<code>doubao-embedding-large</code> 等模型，并支持稠密向量、稀疏向量组合，账号级 TPM 限制为每模型 120000 token/min。<a href="https://www.volcengine.com/docs/84313/1791161?utm_source=chatgpt.com">火山引擎</a></p>
+<p>腾讯云 VectorDB 则更偏“向量数据库 + 文档预处理 + 自动向量化 + 检索精排”的一体化路线，公开页面显示基础实例从约 344 元/月起，并提供端到端 AI 套件。<a href="https://cloud.tencent.com/product/vdb?utm_source=chatgpt.com">腾讯云</a></p>
+<hr />
+<h2>价格大概怎么理解</h2>
+<p>Embedding 价格其实很低。真正贵的通常不是“第一次把教材向量化”，而是后续的：</p>
+<ul>
+<li>向量数据库存储；</li>
+<li>高并发检索；</li>
+<li>rerank 重排；</li>
+<li>Agent 每次调用大模型生成答案；</li>
+<li>文档解析、OCR、表格识别、图片理解；</li>
+<li>后续教材版本更新后的增量重建。</li>
+</ul>
+<p>按公式计算：</p>
+<blockquote>
+<p><strong>Embedding 成本 = 教材 token 数 ÷ 1,000,000 × 单价</strong></p>
+</blockquote>
+<p>假设一批医学教材、题库、操作规范合计 <strong>1 亿 token</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>单价</th>
+<th>1 亿 token 粗略成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OpenAI <code>text-embedding-3-small</code></td>
+<td>$0.02 / 百万 token</td>
+<td>*<em>$2*</em></td>
+</tr>
+<tr>
+<td>OpenAI <code>text-embedding-3-large</code></td>
+<td>$0.13 / 百万 token</td>
+<td><strong>$13</strong></td>
+</tr>
+<tr>
+<td>阿里 <code>text-embedding-v4</code></td>
+<td>~$0.07 / 百万 token</td>
+<td>*<em>约 $7*</em></td>
+</tr>
+<tr>
+<td>智谱 <code>Embedding-3</code></td>
+<td>0.5 元 / 百万 token</td>
+<td><strong>约 50 元</strong></td>
+</tr>
+<tr>
+<td>Voyage <code>voyage-4-large</code></td>
+<td>$0.12 / 百万 token</td>
+<td><strong>$12</strong></td>
+</tr>
+<tr>
+<td>Google Gemini Embedding 2</td>
+<td>$0.20 / 百万 token</td>
+<td><strong>$20</strong></td>
+</tr>
+</tbody>
+</table>
+<p>所以，<strong>embedding 本身不是成本大头</strong>。你真正要控制的是：向量维度、chunk 数量、重叠比例、是否重复入库、是否每次都 rerank、是否对图片和表格做多模态解析。</p>
+<hr />
+<h2>对医学教材 RAG 的推荐路线</h2>
+<h3>第一阶段：先做中文医学教材标准 RAG</h3>
+<p>建议优先选：</p>
+<blockquote>
+<p><strong>阿里百炼 <code>text-embedding-v4</code> + Milvus / Qdrant / pgvector / 腾讯云 VectorDB / 火山 VikingDB + reranker</strong></p>
+</blockquote>
+<p>理由很直接：</p>
+<p>中文教材、医学术语、教学场景、国内合规、工程落地，阿里 Qwen3-Embedding 系列更适合作为国产主力。Qwen3 Embedding 技术报告显示，该系列覆盖 0.6B、4B、8B 多个规模，面向 embedding 和 reranking，强调多语言、跨语言检索、代码检索等多类任务，并以 Apache 2.0 开放。<a href="https://arxiv.org/abs/2506.05176?utm_source=chatgpt.com">arXiv</a></p>
+<h3>第二阶段：引入 reranker，而不是盲目换更贵 embedding</h3>
+<p>医学教材 RAG 的典型问题不是“完全找不到”，而是“找到了很多相似段落，但排序不准”。例如：</p>
+<ul>
+<li>肺炎、支气管炎、肺结核的症状相似；</li>
+<li>护理操作流程中“评估—准备—实施—观察—记录”结构相似；</li>
+<li>同一个药物在药理学、内科学、护理学教材中的描述角度不同；</li>
+<li>考试题干经常不是直接问知识点，而是通过病例间接考察。</li>
+</ul>
+<p>因此建议采用：</p>
+<blockquote>
+<p><strong>Embedding 召回 Top 30–50 → reranker 重排 Top 5–10 → LLM 基于证据回答</strong></p>
+</blockquote>
+<p>智谱知识库服务中 <code>GLM-rerank</code>、<code>GLM-rerank-pro</code> 标价为 <strong>0.8 元 / 百万 token</strong>，也提供 bge-reranker-large 免费项；这类 rerank 成本通常可控，但对准确率提升明显。<a href="https://docs.bigmodel.cn/cn/guide/tools/knowledge/price?utm_source=chatgpt.com">智谱AI开放文档</a></p>
+<h3>第三阶段：对图表、流程图、解剖图做多模态增强</h3>
+<p>医学教材大量知识在图里，不在正文里。单纯文本 embedding 会漏掉：</p>
+<ul>
+<li>解剖结构图；</li>
+<li>护理操作流程图；</li>
+<li>临床路径图；</li>
+<li>实训步骤图；</li>
+<li>表格中的药物剂量、适应证、禁忌证；</li>
+<li>病例影像和图注。</li>
+</ul>
+<p>这时可以选择两条路线：</p>
+<ol>
+<li><strong>低成本路线</strong>：OCR + 表格解析 + 图注生成，再把文本入库。</li>
+<li><strong>高端路线</strong>：使用 Cohere Embed v4、Google Gemini Embedding 2、Jina v4/v5 这类多模态 embedding 做图文统一检索。Cohere Embed v4 支持文本、图像、混合图文/PDF，128K 上下文，维度支持 256、512、1024、1536。<a href="https://docs.cohere.com/changelog/embed-multimodal-v4?utm_source=chatgpt.com">Cohere 文档+1</a></li>
+</ol>
+<hr />
+<h2>“最贵的最好的”怎么选</h2>
+<h3>最贵之一：Google Gemini Embedding 2</h3>
+<p>Google 公开价格中，Gemini Embedding 是 <strong>$0.00015 / 1000 input tokens</strong>，即 <strong>$0.15 / 百万 token</strong>；Gemini Embedding 2 文本输入是 <strong>$0.20 / 百万 token</strong>，图像、视频、音频另行计费。<a href="https://cloud.google.com/vertex-ai/generative-ai/pricing?linkId=26729974">Google Cloud</a></p>
+<p>它适合做高端多模态知识库、图文混合教材、复杂 PDF 检索，但如果你的第一阶段只是中文医学教材正文和题库，未必是投入产出比最高的方案。</p>
+<h3>高端通用：Voyage 4 Large</h3>
+<p>Voyage 官方文档显示，<code>voyage-4-large</code> 价格 <strong>$0.12 / 百万 token</strong>，上下文 32K，支持 256、512、1024、2048 输出维度；Voyage 还提供前 2 亿 token 免费额度，适合做大规模评测和试点。<a href="https://docs.voyageai.com/docs/pricing?utm_source=chatgpt.com">Voyage AI+1</a></p>
+<p>Voyage 4 系列还支持“共享 embedding 空间”，也就是可以用不同成本等级的模型生成可兼容向量，这对企业后期做成本优化很有价值。<a href="https://blog.voyageai.com/2026/01/15/voyage-4/?utm_source=chatgpt.com">Voyage AI</a></p>
+<h3>稳定通用：OpenAI text-embedding-3-large</h3>
+<p>OpenAI <code>text-embedding-3-large</code> 价格是 <strong>$0.13 / 百万 token</strong>，batch 为 <strong>$0.065 / 百万 token</strong>；<code>text-embedding-3-small</code> 是 <strong>$0.02 / 百万 token</strong>，batch 为 <strong>$0.01 / 百万 token</strong>。<a href="https://platform.openai.com/docs/pricing/?utm_source=chatgpt.com">OpenAI平台</a></p>
+<p>我的判断：OpenAI 适合作为国际标准参照组，但在国内医学教材商业项目中，不一定适合作为默认生产模型，主要考虑数据合规、网络稳定、客户接受度和本地化部署要求。</p>
+<hr />
+<h2>给天堰医学教育场景的落地建议</h2>
+<p>我建议你们把 embedding 选型做成一个小型评测项目，而不是拍脑袋选一家。</p>
+<h3>推荐评测组合</h3>
+<p>第一组，国产主力：</p>
+<ul>
+<li>阿里 <code>text-embedding-v4</code></li>
+<li>智谱 <code>Embedding-3</code></li>
+<li>火山 <code>doubao-embedding-large</code></li>
+<li>开源自部署 <code>Qwen3-Embedding-4B / 8B</code> 或 <code>bge-m3</code></li>
+</ul>
+<p>第二组，国际对标：</p>
+<ul>
+<li>OpenAI <code>text-embedding-3-large</code></li>
+<li>Voyage <code>voyage-4-large</code></li>
+<li>Google Gemini Embedding</li>
+<li>Cohere Embed v4</li>
+</ul>
+<h3>评测数据集</h3>
+<p>从你们真实业务里抽取：</p>
+<ul>
+<li>100 个医学教材知识点问答；</li>
+<li>100 个护士资格证 / 执业医师 / 规培考试题干；</li>
+<li>50 个临床思维病例问题；</li>
+<li>50 个护理操作流程问题；</li>
+<li>50 个“容易混淆”的鉴别诊断问题；</li>
+<li>30 个图表类问题。</li>
+</ul>
+<h3>核心指标</h3>
+<p>不要只看向量模型排行榜，要看：</p>
+<ul>
+<li>Top 5 是否召回正确教材段落；</li>
+<li>Top 10 是否召回正确章节；</li>
+<li>rerank 后 Top 3 是否有可用于回答的证据；</li>
+<li>回答是否能引用教材出处、章节、页码；</li>
+<li>是否能区分相似概念；</li>
+<li>是否能支撑考试题解析；</li>
+<li>是否适合批量更新教材版本；</li>
+<li>单次问答整体成本，而不仅是 embedding 成本。</li>
+</ul>
+<hr />
+<h2>最终推荐</h2>
+<p>如果现在就要启动，我建议：</p>
+<blockquote>
+<p><strong>生产优先方案：阿里百炼 <code>text-embedding-v4</code> + Qwen3-Reranker / bge-reranker + Milvus 或腾讯云 VectorDB / 火山 VikingDB。</strong></p>
+</blockquote>
+<blockquote>
+<p><strong>高端对标方案：Voyage <code>voyage-4-large</code> + OpenAI <code>text-embedding-3-large</code> + Google Gemini Embedding 2 做小样本评测。</strong></p>
+</blockquote>
+<blockquote>
+<p><strong>私有化战略方案：Qwen3-Embedding-4B / 8B 或 bge-m3 本地部署 + 本地 reranker + Milvus / pgvector。</strong></p>
+</blockquote>
+<p>对医学教育企业来说，长期最有价值的不是买最贵的 embedding API，而是沉淀一套 <strong>“医学教材知识工程流水线”</strong>：教材解析、知识点切分、术语标准化、向量化、题库关联、病例关联、图表解析、证据引用、模型评测、版本更新。Embedding 服务只是其中一个环节。</p>
+<hr />
+<p><strong>You:</strong></p>
+<p>对医学教育企业来说，长期最有价值的不是买最贵的 embedding API，而是沉淀一套 <strong>“医学教材知识工程流水线”</strong>：教材解析、知识点切分、术语标准化、向量化、题库关联、病例关联、图表解析、证据引用、模型评测、版本更新。Embedding 服务只是其中一个环节。我非常同意你的观点。我想你把这一段展开说一下，我要做的这项工作每个环节。把它稍微的主要核心的环节给展开讲一讲。主要告诉我一些需要注意的事项，例如，我现在计划把教材做成扫描件。使用minor U。来把它进行解释。获取到文本图片等格式的材料之后，还要进行切片。切片这里应该如何切片，有什么技巧？我计划是直接把我获取到的文本图片的材料，通过大模型进行处理后再切片。然后你说的术语标准化向量化是什么意思？我不是很懂，这里面有什么技巧，需要提前做吗？还有您说到的题库关联，病例关联，这里面。具体是做什么的？应该怎么做？我们现在的图片解释是把图片存在阿里云的OSS上面，然后获取到相关的地址，然后再。通过ID检索到相关的内容之后，再获取这个地址的图片。你说到的证据引用模型评测，这里面我也不是很了解，具体是什么。请你用一个实际的案例。比如说用基础护理学这本教材的一个章节来作为实际的案例，说说上面操作过程当中的一些细节和。过程，还有注意事项。我觉得所有的Embedding这些技术其实都是公开的，它不是我们公司的核心，我们公司的核心是应该找到一个更加准确的技术路径，将医学教材的embedding做得更加好，比其他公司要做得好，这个才是我们的核心的竞争力，在这个过程当中，产品技术服务都是基本公开透明一样的。那么做得更加好的是在哪个环节？比如说是不是Embedding的提示词，知识点切分的方式方法。还有什么其他的内容。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<p>关键原则是：先建立“可信原文层”，再建立“AI增强层”。不要先让大模型改写教材正文再入库，否则后续引用、追责、版本更新都会失真。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<p>您这个判断是对的：<strong>Embedding 技术本身不是壁垒，医学教材知识工程能力才是壁垒。</strong></p>
+<p>真正能形成天堰核心竞争力的，不是“我用了哪个 embedding 模型”，而是能不能把一本医学教材加工成一个 <strong>结构清晰、证据可信、可检索、可追溯、可关联题库和病例、可持续迭代的医学教育知识资产</strong>。</p>
+<p>我理解您说的 “minor U” 应该是 <strong>MinerU</strong>。它是一个面向 RAG 和 Agent 工作流的文档解析工具，可以把 PDF、图片、DOCX、PPTX、XLSX 等转换为 Markdown / JSON，并支持扫描件 OCR、图片提取、表格识别、公式识别、页眉页脚去除、阅读顺序恢复等能力。官方说明中也提到，它支持输出结构化 JSON、提取图片、表格、图注、脚注，并支持 109 种语言 OCR。<a href="https://github.com/opendatalab/mineru">GitHub</a></p>
+<p>下面我按一条真实流水线展开。</p>
+<hr />
+<h1>一、整体路线：不要把教材简单“向量化”，而是做成医学教育知识工程</h1>
+<p>建议把整个工作拆成 10 个核心环节：</p>
+<ol>
+<li><strong>教材扫描与原始文件管理</strong></li>
+<li><strong>文档解析：OCR、版面识别、图片表格提取</strong></li>
+<li><strong>原文清洗与结构化还原</strong></li>
+<li><strong>知识点级切分</strong></li>
+<li><strong>术语标准化</strong></li>
+<li><strong>图片、表格、流程图知识化</strong></li>
+<li><strong>向量化与混合索引</strong></li>
+<li><strong>题库关联、病例关联</strong></li>
+<li><strong>证据引用与可追溯展示</strong></li>
+<li><strong>模型评测与版本迭代</strong></li>
+</ol>
+<p>这 10 个环节里，最有技术壁垒和产品壁垒的是：</p>
+<blockquote>
+<p><strong>教材解析质量、知识点切分规则、医学术语标准化、题库病例关联、证据引用、评测体系。</strong></p>
+</blockquote>
+<p>Embedding 只是其中一个基础环节。</p>
+<hr />
+<h1>二、第一步：扫描件处理，不要低估“源头质量”</h1>
+<p>如果您计划把纸质教材做成扫描件，第一件事不是马上进 MinerU，而是先保证扫描质量。</p>
+<h2>1. 扫描建议</h2>
+<p>建议标准：</p>
+<ul>
+<li>分辨率：<strong>300 DPI 起步</strong>，复杂图表、解剖图、流程图可以 400 DPI；</li>
+<li>彩色扫描优于黑白扫描，尤其是医学教材中的图示、箭头、颜色标注；</li>
+<li>每页必须保留页码；</li>
+<li>扫描时尽量避免阴影、倾斜、书脊弯曲；</li>
+<li>每本教材建立唯一 <code>doc_id</code>；</li>
+<li>每页建立唯一 <code>page_id</code>；</li>
+<li>原始扫描文件永久保留，不能被后续处理文件覆盖。</li>
+</ul>
+<h2>2. 原始文件要分层保存</h2>
+<p>建议建立三层文件：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>内容</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始层</td>
+<td>扫描 PDF / 原图</td>
+<td>法务、版权、追溯、重新解析</td>
+</tr>
+<tr>
+<td>解析层</td>
+<td>MinerU 输出的 JSON / Markdown / 图片</td>
+<td>知识工程加工</td>
+</tr>
+<tr>
+<td>增强层</td>
+<td>大模型生成的摘要、关键词、术语、问题</td>
+<td>检索增强、教学应用</td>
+</tr>
+</tbody>
+</table>
+<p>这里有一个非常重要的原则：</p>
+<blockquote>
+<p><strong>教材原文不能被大模型改写后直接作为唯一知识源。</strong></p>
+</blockquote>
+<p>大模型可以帮您提取知识点、生成摘要、生成图片说明、生成题目，但不能替代教材原文。否则以后学生问：“这个答案依据教材哪里？”系统就无法严谨追溯。</p>
+<hr />
+<h1>三、第二步：MinerU 解析之后，优先使用 JSON，不要只用 Markdown</h1>
+<p>MinerU 可以输出 Markdown 和 JSON。Markdown 适合人看，JSON 更适合系统加工。官方文档也明确提到 MinerU 可以把文档转换为机器可读的 Markdown / JSON，并保持标题、段落、列表等结构。<a href="https://github.com/opendatalab/mineru">GitHub</a></p>
+<p>建议您把 <strong>JSON 作为主数据来源</strong>。</p>
+<p>每一个内容块都要保存：</p>
+<pre><code class="language-JSON">{
+  &quot;doc_id&quot;: &quot;basic_nursing_2024&quot;,
+  &quot;book_name&quot;: &quot;基础护理学&quot;,
+  &quot;edition&quot;: &quot;第X版&quot;,
+  &quot;chapter&quot;: &quot;第X章 静脉输液与输血&quot;,
+  &quot;section&quot;: &quot;静脉输液&quot;,
+  &quot;page_no&quot;: 128,
+  &quot;block_id&quot;: &quot;basic_nursing_2024_p128_b03&quot;,
+  &quot;block_type&quot;: &quot;paragraph&quot;,
+  &quot;text&quot;: &quot;原文内容……&quot;,
+  &quot;bbox&quot;: [120, 350, 860, 520],
+  &quot;source_file&quot;: &quot;oss://xxx/original.pdf&quot;,
+  &quot;page_image&quot;: &quot;oss://xxx/page_128.png&quot;
+}
+</code></pre>
+<p>这几个字段非常关键：</p>
+<ul>
+<li><code>doc_id</code>：知道来自哪本书；</li>
+<li><code>edition</code>：知道是哪个版本；</li>
+<li><code>chapter / section</code>：知道知识层级；</li>
+<li><code>page_no</code>：后续证据引用必须用；</li>
+<li><code>block_id</code>：每个知识块的唯一身份；</li>
+<li><code>bbox</code>：以后可以在页面图片上高亮原文位置；</li>
+<li><code>block_type</code>：区分正文、标题、图片、表格、图注、脚注。</li>
+</ul>
+<p>这就是后续“可信证据链”的基础。</p>
+<hr />
+<h1>四、第三步：不要“先让大模型处理后再切片”，建议改成“先结构化，再增强，再切片优化”</h1>
+<p>您现在的设想是：</p>
+<blockquote>
+<p>扫描件 → MinerU 获取文本图片 → 大模型处理 → 再切片。</p>
+</blockquote>
+<p>我的建议是稍微调整为：</p>
+<blockquote>
+<p>扫描件 → MinerU 结构化解析 → 原文清洗 → 初步结构切分 → 大模型增强 → 最终知识切片 → 入库。</p>
+</blockquote>
+<p>原因是：大模型处理文本时，有可能会改写、合并、遗漏、补充。医学教材做 RAG，最怕“增强层污染原文层”。</p>
+<h2>正确做法</h2>
+<p>大模型应该做这些事：</p>
+<ul>
+<li>修复标题层级；</li>
+<li>判断某一段属于哪个知识点；</li>
+<li>提取关键词；</li>
+<li>抽取医学术语；</li>
+<li>生成摘要；</li>
+<li>生成教学问题；</li>
+<li>生成图片说明；</li>
+<li>判断这段适合关联哪些题库、病例、实训项目。</li>
+</ul>
+<p>但大模型不应该做这些事：</p>
+<ul>
+<li>直接改写教材原文后替代原文；</li>
+<li>把多个不同知识点混在一起；</li>
+<li>自行补充教材没有写的内容；</li>
+<li>删除页码、图号、表号等证据线索；</li>
+<li>把图表内容随意总结成不准确文本。</li>
+</ul>
+<p>一句话：</p>
+<blockquote>
+<p><strong>原文层必须忠实，增强层可以智能。</strong></p>
+</blockquote>
+<hr />
+<h1>五、第四步：切片怎么切，这是核心竞争力之一</h1>
+<p>切片不是简单按 500 字、800 字切。医学教材切片要遵循“教学语义单元”。</p>
+<h2>1. 切片的核心原则</h2>
+<p>我建议用一句话定义：</p>
+<blockquote>
+<p><strong>一个 chunk 最好只解决一个明确的教学问题。</strong></p>
+</blockquote>
+<p>例如在《基础护理学》的“静脉输液”章节中，不要把“概念、目的、操作流程、注意事项、常见并发症、处理方法”全部放在一个 chunk 里。</p>
+<p>应该拆成：</p>
+<ul>
+<li>静脉输液的概念；</li>
+<li>静脉输液的目的；</li>
+<li>静脉输液前评估；</li>
+<li>静脉输液用物准备；</li>
+<li>静脉输液操作流程；</li>
+<li>输液速度调节；</li>
+<li>输液过程观察；</li>
+<li>常见故障处理；</li>
+<li>输液反应识别；</li>
+<li>输液外渗处理；</li>
+<li>静脉炎预防与护理；</li>
+<li>操作后的记录与健康教育。</li>
+</ul>
+<p>这才适合 Agent 精准检索。</p>
+<h2>2. 推荐三层切片法</h2>
+<h3>第一层：父级切片</h3>
+<p>父级切片通常对应一个小节，例如：</p>
+<blockquote>
+<p>第X章 静脉输液与输血<br />
+第X节 静脉输液<br />
+小节：输液过程中的观察与护理</p>
+</blockquote>
+<p>父级切片不一定直接 embedding，而是作为上下文容器。</p>
+<h3>第二层：子级切片</h3>
+<p>子级切片是真正用于 embedding 的内容。</p>
+<p>例如：</p>
+<pre><code>知识点：输液过程中的滴速观察
+来源：基础护理学 / 第X章 / 静脉输液 / 第128页
+内容：教材原文……
+</code></pre>
+<p>子级切片长度建议：</p>
+<ul>
+<li>普通概念类：300–600 个中文字符；</li>
+<li>操作流程类：500–1000 个中文字符；</li>
+<li>表格类：按表格主题切，不按字数切；</li>
+<li>图片类：按图片说明、图注、关联正文一起切；</li>
+<li>复杂知识点：允许一个父级下挂多个子级。</li>
+</ul>
+<h3>第三层：增强切片</h3>
+<p>增强切片不是原文，而是为检索服务的补充文本，例如：</p>
+<pre><code>本段主要讲静脉输液过程中护士应观察患者局部穿刺部位、输液速度、患者主诉和不良反应。相关问题包括：输液局部肿胀怎么办？输液速度过快有什么风险？如何判断输液外渗？
+</code></pre>
+<p>这个增强切片可以提升召回率，但回答时必须回到原文证据。</p>
+<hr />
+<h1>六、医学教材切片的具体技巧</h1>
+<h2>技巧一：标题路径必须进入 chunk</h2>
+<p>不要只存正文，要把标题路径一起放进去。</p>
+<p>例如：</p>
+<pre><code>教材：基础护理学
+章节：第X章 静脉输液与输血
+小节：静脉输液过程中的观察与护理
+知识点：输液外渗的识别与处理
+正文：……
+</code></pre>
+<p>这样学生问“输液局部肿了怎么办”，系统更容易定位到“静脉输液”而不是泛泛地找到“水肿”“疼痛”“炎症”。</p>
+<h2>技巧二：操作流程类知识不能机械按字数切</h2>
+<p>护理教材里大量内容是流程型知识，例如：</p>
+<ul>
+<li>操作前评估；</li>
+<li>操作前准备；</li>
+<li>操作中核对；</li>
+<li>操作中观察；</li>
+<li>操作后记录；</li>
+<li>注意事项；</li>
+<li>异常情况处理。</li>
+</ul>
+<p>这类内容应该按流程阶段切，而不是按字符数切。</p>
+<p>建议切成：</p>
+<pre><code>chunk_1：操作前评估与准备用物
+chunk_2：操作中关键步骤
+chunk_3：操作后观察与记录
+chunk_4：异常情况与处理
+</code></pre>
+<h2>技巧三：表格要单独处理</h2>
+<p>医学教材中的表格非常关键。比如：</p>
+<ul>
+<li>常见输液故障及处理；</li>
+<li>常见输液反应及护理措施；</li>
+<li>常用溶液种类和作用；</li>
+<li>护理诊断与护理措施对照表。</li>
+</ul>
+<p>不要把表格转成一大段自然语言。应该保留表格结构。</p>
+<p>建议每个表格保存三份内容：</p>
+<ol>
+<li>原始表格 HTML；</li>
+<li>表格转 Markdown；</li>
+<li>表格摘要和行级知识点。</li>
+</ol>
+<p>例如：</p>
+<pre><code class="language-JSON">{
+  &quot;block_type&quot;: &quot;table&quot;,
+  &quot;table_title&quot;: &quot;常见输液故障及处理&quot;,
+  &quot;html&quot;: &quot;&lt;table&gt;...&lt;/table&gt;&quot;,
+  &quot;markdown&quot;: &quot;|故障|表现|处理|...&quot;,
+  &quot;summary&quot;: &quot;本表说明静脉输液过程中常见故障、表现及处理方法。&quot;,
+  &quot;related_knowledge_points&quot;: [&quot;输液故障&quot;, &quot;输液不滴&quot;, &quot;穿刺部位肿胀&quot;]
+}
+</code></pre>
+<h2>技巧四：图片不能只存 OSS 地址</h2>
+<p>您现在的做法是：</p>
+<blockquote>
+<p>图片存阿里云 OSS → 保存地址 → 检索到 ID 后再获取图片。</p>
+</blockquote>
+<p>这个方向是对的，但还不够。</p>
+<p>图片至少要保存 6 类信息：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>image_id</code></td>
+<td>图片唯一 ID</td>
+</tr>
+<tr>
+<td><code>oss_key</code></td>
+<td>OSS 存储路径</td>
+</tr>
+<tr>
+<td><code>page_no</code></td>
+<td>来自教材哪一页</td>
+</tr>
+<tr>
+<td><code>bbox</code></td>
+<td>图片在页面中的位置</td>
+</tr>
+<tr>
+<td><code>caption</code></td>
+<td>教材原始图注</td>
+</tr>
+<tr>
+<td><code>visual_summary</code></td>
+<td>大模型生成的图片说明</td>
+</tr>
+<tr>
+<td><code>related_text_block_ids</code></td>
+<td>图片关联的正文段落</td>
+</tr>
+<tr>
+<td><code>knowledge_points</code></td>
+<td>图片对应知识点</td>
+</tr>
+</tbody>
+</table>
+<p>重点是：</p>
+<blockquote>
+<p><strong>向量检索时通常不是检索 OSS 地址，而是检索图片的文字说明、图注、关联正文和知识点标签。</strong></p>
+</blockquote>
+<p>当用户问到相关问题时，系统先通过文字索引找到图片，再通过 <code>image_id</code> 获取 OSS 图片。</p>
+<p>建议 OSS 地址不要直接暴露公网固定 URL，而是通过后端生成临时访问地址，避免教材图片泄露。</p>
+<h2>技巧五：建立“原文 chunk”和“检索增强 chunk”的双轨机制</h2>
+<p>一个 chunk 可以有两个文本版本：</p>
+<h3>1. 用于展示和引用的原文</h3>
+<pre><code>教材原文：……
+</code></pre>
+<h3>2. 用于 embedding 的检索文本</h3>
+<pre><code>教材：基础护理学
+章节：静脉输液
+知识点：输液外渗的识别与处理
+同义表达：输液局部肿胀、针眼周围疼痛、液体渗出、穿刺部位异常
+正文摘要：本段讲述……
+原文：……
+</code></pre>
+<p>这样做的好处是：向量检索更容易命中，但最终回答仍然引用原文。</p>
+<hr />
+<h1>七、术语标准化是什么意思</h1>
+<p>您问得非常关键。</p>
+<p><strong>术语标准化</strong>就是把教材中不同说法、学生口语表达、题库表达、临床表达统一映射到同一个标准知识点。</p>
+<p>例如学生可能问：</p>
+<ul>
+<li>“输液的地方肿了怎么办？”</li>
+<li>“针眼附近鼓起来了怎么办？”</li>
+<li>“是不是输液外渗？”</li>
+<li>“静脉输液局部疼痛怎么处理？”</li>
+<li>“液体没有进血管怎么办？”</li>
+</ul>
+<p>这些问题在语义上可能都指向同一类知识点：</p>
+<blockquote>
+<p><strong>输液外渗 / 穿刺部位异常 / 静脉输液并发问题</strong></p>
+</blockquote>
+<p>如果不做术语标准化，embedding 也能部分召回，但不够稳定。尤其是医学教育场景里，学生问法、教师问法、教材说法、考试说法往往不一样。</p>
+<h2>术语标准化要做什么</h2>
+<p>建议建立一个内部医学教育术语表：</p>
+<pre><code class="language-JSON">{
+  &quot;standard_term&quot;: &quot;输液外渗&quot;,
+  &quot;aliases&quot;: [
+    &quot;液体外渗&quot;,
+    &quot;局部肿胀&quot;,
+    &quot;穿刺部位肿胀&quot;,
+    &quot;输液部位疼痛&quot;,
+    &quot;液体渗出&quot;
+  ],
+  &quot;english&quot;: &quot;extravasation&quot;,
+  &quot;category&quot;: &quot;护理操作并发症&quot;,
+  &quot;subject&quot;: &quot;基础护理学&quot;,
+  &quot;related_terms&quot;: [&quot;静脉输液&quot;, &quot;静脉炎&quot;, &quot;输液反应&quot;],
+  &quot;related_chapters&quot;: [&quot;静脉输液与输血&quot;]
+}
+</code></pre>
+<h2>术语标准化在哪里发挥作用</h2>
+<p>主要有 4 个地方：</p>
+<ol>
+<li><strong>教材入库时</strong><br />
+给 chunk 打标准知识点标签。</li>
+<li><strong>题库关联时</strong><br />
+判断一道题考的是哪个知识点。</li>
+<li><strong>用户提问时</strong><br />
+把口语问题扩展成标准医学术语。</li>
+<li><strong>学习分析时</strong><br />
+把学生错题、问答、练习表现归到统一知识点。</li>
+</ol>
+<p>例如学生问：</p>
+<blockquote>
+<p>“输液的时候局部鼓包，是不是正常？”</p>
+</blockquote>
+<p>系统应该先识别：</p>
+<pre><code>局部鼓包 → 穿刺部位肿胀 → 可能关联输液外渗 / 静脉炎 / 穿刺失败
+</code></pre>
+<p>然后再检索对应教材证据。</p>
+<p>这比单纯 embedding 更稳定。</p>
+<hr />
+<h1>八、向量化到底是什么</h1>
+<p>向量化就是把文本变成一组数字，让系统能计算“语义相似度”。</p>
+<p>但在医学教材 RAG 里，真正要注意的是：</p>
+<blockquote>
+<p><strong>不是把整页教材扔进去向量化，而是把经过结构化、切片、术语标注后的知识块向量化。</strong></p>
+</blockquote>
+<h2>推荐向量化对象</h2>
+<p>不要向量化这些：</p>
+<ul>
+<li>整本书；</li>
+<li>整章；</li>
+<li>整页扫描 OCR 文本；</li>
+<li>没有标题路径的孤立段落；</li>
+<li>大模型自由改写后的总结文本。</li>
+</ul>
+<p>应该向量化这些：</p>
+<ul>
+<li>一个明确知识点；</li>
+<li>一个操作流程阶段；</li>
+<li>一个表格主题；</li>
+<li>一张图片的图注 + 图片说明 + 关联正文；</li>
+<li>一个题目解析对应的知识点；</li>
+<li>一个病例决策点对应的教材依据。</li>
+</ul>
+<h2>推荐向量化模板</h2>
+<p>例如一个用于 embedding 的文本可以这样构造：</p>
+<pre><code>教材：基础护理学
+版本：第X版
+章节：第X章 静脉输液与输血
+小节：静脉输液过程中的观察与护理
+知识点：输液外渗的识别与处理
+同义词：局部肿胀、穿刺部位疼痛、液体渗出、输液部位异常
+教学场景：护理操作、基础护理实训、护士资格证备考
+正文：……
+</code></pre>
+<p>这个模板本身就是竞争力。</p>
+<p>因为大多数公司只是“把文本切块后 embedding”，而您们可以做到：</p>
+<blockquote>
+<p><strong>带教材结构、带医学术语、带教学场景、带题库关联、带病例关联的向量化。</strong></p>
+</blockquote>
+<p>这就是医学教育垂直领域的差异化。</p>
+<hr />
+<h1>九、题库关联具体做什么</h1>
+<p>题库关联不是简单把题库也 embedding 进去。</p>
+<p>它的目标是：</p>
+<blockquote>
+<p><strong>每一道题都能找到它考查的教材知识点、证据段落、能力层级和常见错误原因。</strong></p>
+</blockquote>
+<p>例如一道题：</p>
+<pre><code>开展静脉输液操作前，护士首先应进行哪项工作？
+A. 调节滴速
+B. 选择穿刺部位
+C. 核对医嘱和患者信息
+D. 固定针柄
+</code></pre>
+<p>这道题不能只是作为一个独立题目存在，而应该关联到：</p>
+<pre><code class="language-JSON">{
+  &quot;question_id&quot;: &quot;q_000123&quot;,
+  &quot;subject&quot;: &quot;基础护理学&quot;,
+  &quot;chapter&quot;: &quot;静脉输液与输血&quot;,
+  &quot;knowledge_points&quot;: [&quot;静脉输液操作流程&quot;, &quot;三查七对&quot;, &quot;患者身份核对&quot;],
+  &quot;evidence_chunk_ids&quot;: [
+    &quot;basic_nursing_p126_b04&quot;,
+    &quot;basic_nursing_p127_b02&quot;
+  ],
+  &quot;difficulty&quot;: &quot;基础&quot;,
+  &quot;cognitive_level&quot;: &quot;记忆/理解&quot;,
+  &quot;exam_scene&quot;: &quot;护士资格证/校内实训考核&quot;,
+  &quot;common_errors&quot;: [&quot;忽略操作前核对&quot;, &quot;直接进入穿刺步骤&quot;]
+}
+</code></pre>
+<h2>题库关联有什么价值</h2>
+<p>它可以支撑 5 个核心产品能力：</p>
+<ol>
+<li>学生做错题后，自动回到教材原文；</li>
+<li>智能辅导智能体可以解释“为什么选这个，为什么不选其他”；</li>
+<li>教师可以看到学生薄弱知识点；</li>
+<li>系统可以自动生成同知识点变式题；</li>
+<li>学校可以看到课程、章节、知识点、考试结果之间的关系。</li>
+</ol>
+<p>这就是从“知识库”升级到“教学数据资产”。</p>
+<hr />
+<h1>十、病例关联具体做什么</h1>
+<p>病例关联是把教材知识点和临床情境连接起来。</p>
+<p>基础护理学中很多知识不是孤立概念，而是在真实场景中使用的。例如：</p>
+<pre><code>患者输液 20 分钟后，主诉穿刺部位疼痛，局部皮肤肿胀，输液滴速变慢。
+</code></pre>
+<p>这个病例应关联到：</p>
+<ul>
+<li>静脉输液；</li>
+<li>穿刺部位观察；</li>
+<li>输液外渗；</li>
+<li>静脉炎鉴别；</li>
+<li>输液故障处理；</li>
+<li>护理记录；</li>
+<li>健康教育。</li>
+</ul>
+<p>病例数据结构可以这样设计：</p>
+<pre><code class="language-JSON">{
+  &quot;case_id&quot;: &quot;case_iv_001&quot;,
+  &quot;case_title&quot;: &quot;静脉输液过程中局部肿胀案例&quot;,
+  &quot;scene&quot;: &quot;基础护理实训&quot;,
+  &quot;patient_info&quot;: &quot;模拟患者，基本信息略&quot;,
+  &quot;symptoms&quot;: [&quot;穿刺部位疼痛&quot;, &quot;局部肿胀&quot;, &quot;滴速变慢&quot;],
+  &quot;decision_points&quot;: [
+    {
+      &quot;question&quot;: &quot;护士应首先观察和判断什么？&quot;,
+      &quot;related_knowledge_points&quot;: [&quot;输液外渗&quot;, &quot;输液过程观察&quot;],
+      &quot;evidence_chunk_ids&quot;: [&quot;basic_nursing_p128_b03&quot;]
+    }
+  ],
+  &quot;teaching_objectives&quot;: [&quot;识别输液异常&quot;, &quot;进行初步处理&quot;, &quot;完成护理记录&quot;]
+}
+</code></pre>
+<h2>病例关联的价值</h2>
+<p>它可以支撑：</p>
+<ul>
+<li>AISP 虚拟病人问诊；</li>
+<li>临床思维训练；</li>
+<li>护理思维训练；</li>
+<li>OSCE 考站设计；</li>
+<li>实训任务设计；</li>
+<li>智能陪练智能体；</li>
+<li>教师备课智能体；</li>
+<li>学生个性化辅导智能体。</li>
+</ul>
+<p>这正是天堰的优势。别人做知识库，您们可以做：</p>
+<blockquote>
+<p><strong>教材知识点 + 题库 + 病例 + 实训 + 评价数据的一体化闭环。</strong></p>
+</blockquote>
+<hr />
+<h1>十一、证据引用是什么</h1>
+<p>证据引用就是 Agent 回答问题时，不能只给答案，还要说明：</p>
+<ul>
+<li>依据哪本教材；</li>
+<li>哪一版；</li>
+<li>哪一章；</li>
+<li>哪一节；</li>
+<li>第几页；</li>
+<li>哪个段落；</li>
+<li>哪张图；</li>
+<li>哪个表格。</li>
+</ul>
+<p>例如学生问：</p>
+<blockquote>
+<p>“输液时局部肿胀应该怎么办？”</p>
+</blockquote>
+<p>系统回答不能只是：</p>
+<blockquote>
+<p>“可能是输液外渗，应停止输液并进行处理。”</p>
+</blockquote>
+<p>更好的回答应该是：</p>
+<pre><code>根据《基础护理学》第X版第X章“静脉输液与输血”中关于“输液过程观察与异常处理”的内容，局部肿胀、疼痛、滴速异常等情况提示需要重点观察穿刺部位并判断是否存在输液外渗或相关异常。建议在教学训练中按照教材要求进行观察、停止相关操作、报告教师或带教老师，并完成护理记录。
+
+证据来源：
+1. 《基础护理学》第X章 静脉输液与输血，第128页，段落 basic_nursing_p128_b03
+2. 图X-X 静脉输液穿刺部位观察示意图，image_id: img_00045
+</code></pre>
+<p>前端还可以支持：</p>
+<ul>
+<li>点击引用，打开教材原页图片；</li>
+<li>高亮对应段落；</li>
+<li>显示原图；</li>
+<li>显示表格；</li>
+<li>显示关联题目；</li>
+<li>显示关联病例。</li>
+</ul>
+<p>这就是“可信 RAG”。</p>
+<p>医学教育系统没有证据引用，就很难进入学校和医院的正式教学场景。</p>
+<hr />
+<h1>十二、模型评测是什么</h1>
+<p>模型评测不是评测大模型“聪不聪明”，而是评测整个 RAG 系统是否可靠。</p>
+<p>建议建立一个 <strong>医学教材 RAG 标准评测集</strong>。</p>
+<h2>1. 评测问题类型</h2>
+<p>以《基础护理学》为例，至少设计 7 类问题：</p>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>直接知识问答</td>
+<td>静脉输液的目的是什么？</td>
+</tr>
+<tr>
+<td>操作流程问答</td>
+<td>静脉输液操作前应做哪些评估？</td>
+</tr>
+<tr>
+<td>异常处理问答</td>
+<td>输液过程中局部肿胀怎么办？</td>
+</tr>
+<tr>
+<td>易混淆概念</td>
+<td>输液外渗和静脉炎有什么区别？</td>
+</tr>
+<tr>
+<td>表格检索</td>
+<td>常见输液故障及处理有哪些？</td>
+</tr>
+<tr>
+<td>图片理解</td>
+<td>这张穿刺示意图说明了什么操作要点？</td>
+</tr>
+<tr>
+<td>题目解析</td>
+<td>这道护士资格证题为什么选 C？</td>
+</tr>
+</tbody>
+</table>
+<h2>2. 评测指标</h2>
+<p>至少看 6 个指标：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Recall@5</td>
+<td>前 5 个检索结果是否包含正确教材证据</td>
+</tr>
+<tr>
+<td>Recall@10</td>
+<td>前 10 个结果是否召回正确证据</td>
+</tr>
+<tr>
+<td>Citation Accuracy</td>
+<td>引用页码、章节、段落是否正确</td>
+</tr>
+<tr>
+<td>Answer Faithfulness</td>
+<td>回答是否忠实于教材</td>
+</tr>
+<tr>
+<td>Hallucination Rate</td>
+<td>是否编造教材没有的内容</td>
+</tr>
+<tr>
+<td>Teaching Usefulness</td>
+<td>对学生学习是否有帮助</td>
+</tr>
+</tbody>
+</table>
+<h2>3. 为什么评测是核心壁垒</h2>
+<p>因为 embedding 模型换来换去，谁都可以换。</p>
+<p>但如果您们沉淀了：</p>
+<ul>
+<li>1000 个基础护理学标准问题；</li>
+<li>500 个护士资格证题目解析评测样本；</li>
+<li>300 个护理操作流程评测样本；</li>
+<li>200 个病例推理评测样本；</li>
+<li>每个问题都有标准证据 chunk；</li>
+<li>每次更新模型、切片策略、reranker 都能自动回归测试。</li>
+</ul>
+<p>这就是别人很难短期复制的资产。</p>
+<hr />
+<h1>十三、用《基础护理学》“静脉输液”章节举一个完整例子</h1>
+<p>下面用一个模拟流程说明。</p>
+<h2>第一步：扫描教材</h2>
+<p>文件：</p>
+<pre><code>基础护理学_第X版_第X章_静脉输液与输血.pdf
+</code></pre>
+<p>系统生成：</p>
+<pre><code>doc_id: basic_nursing_vX
+chapter_id: basic_nursing_vX_chapter_iv
+page_range: 120-145
+</code></pre>
+<p>每页保存：</p>
+<pre><code>page_120.png
+page_121.png
+……
+page_145.png
+</code></pre>
+<h2>第二步：MinerU 解析</h2>
+<p>得到：</p>
+<ul>
+<li>正文段落；</li>
+<li>小标题；</li>
+<li>表格；</li>
+<li>图片；</li>
+<li>图注；</li>
+<li>页码；</li>
+<li>阅读顺序；</li>
+<li>图片位置；</li>
+<li>表格 HTML。</li>
+</ul>
+<p>MinerU 官方说明中提到，它支持扫描 PDF、复杂版面、多栏布局、跨页表格合并、图片和图表解析等能力，这类能力正适合医学教材这种“正文 + 表格 + 图示 + 操作流程”混合形态文档。<a href="https://github.com/opendatalab/mineru">GitHub</a></p>
+<h2>第三步：原文清洗</h2>
+<p>处理内容：</p>
+<ul>
+<li>删除页眉页脚；</li>
+<li>删除重复页码；</li>
+<li>修复断行；</li>
+<li>合并跨页段落；</li>
+<li>修正 OCR 明显错误；</li>
+<li>保留图号、表号；</li>
+<li>保留教材原始标题层级。</li>
+</ul>
+<p>例如：</p>
+<pre><code>第X节 静脉输液
+一、静脉输液的目的
+二、静脉输液常用溶液
+三、静脉输液操作流程
+四、输液过程中的观察与护理
+五、常见输液故障及处理
+六、常见输液反应及护理
+</code></pre>
+<h2>第四步：知识点切分</h2>
+<p>切成如下 chunk：</p>
+<pre><code>chunk_001：静脉输液的概念
+chunk_002：静脉输液的目的
+chunk_003：静脉输液前评估
+chunk_004：静脉输液用物准备
+chunk_005：静脉输液操作流程——核对与准备
+chunk_006：静脉输液操作流程——穿刺与固定
+chunk_007：静脉输液操作流程——调节滴速
+chunk_008：输液过程观察
+chunk_009：输液外渗的识别与处理
+chunk_010：静脉炎的观察与护理
+chunk_011：常见输液故障及处理表
+chunk_012：输液装置示意图
+</code></pre>
+<p>每个 chunk 保存：</p>
+<pre><code class="language-JSON">{
+  &quot;chunk_id&quot;: &quot;basic_nursing_vX_ch_iv_009&quot;,
+  &quot;title_path&quot;: &quot;基础护理学 &gt; 静脉输液与输血 &gt; 静脉输液 &gt; 输液过程观察&quot;,
+  &quot;knowledge_point&quot;: &quot;输液外渗的识别与处理&quot;,
+  &quot;source_text&quot;: &quot;教材原文……&quot;,
+  &quot;summary&quot;: &quot;本知识点用于说明静脉输液过程中穿刺部位异常的观察与处理。&quot;,
+  &quot;page_no&quot;: 128,
+  &quot;bbox&quot;: [100, 240, 880, 520],
+  &quot;related_images&quot;: [&quot;img_iv_003&quot;],
+  &quot;related_tables&quot;: [&quot;table_iv_002&quot;],
+  &quot;teaching_scene&quot;: [&quot;基础护理实训&quot;, &quot;护士资格证备考&quot;, &quot;OSCE考核&quot;]
+}
+</code></pre>
+<h2>第五步：术语标准化</h2>
+<p>建立术语映射：</p>
+<pre><code class="language-JSON">{
+  &quot;standard_term&quot;: &quot;输液外渗&quot;,
+  &quot;aliases&quot;: [
+    &quot;局部肿胀&quot;,
+    &quot;穿刺部位肿胀&quot;,
+    &quot;输液部位疼痛&quot;,
+    &quot;液体渗出&quot;,
+    &quot;针眼附近鼓包&quot;
+  ],
+  &quot;subject&quot;: &quot;基础护理学&quot;,
+  &quot;related_chunks&quot;: [&quot;basic_nursing_vX_ch_iv_009&quot;],
+  &quot;related_questions&quot;: [&quot;q_iv_023&quot;, &quot;q_iv_071&quot;],
+  &quot;related_cases&quot;: [&quot;case_iv_001&quot;]
+}
+</code></pre>
+<p>这样学生用口语提问，也能召回标准教材知识点。</p>
+<h2>第六步：图片处理</h2>
+<p>例如教材中有一张“静脉输液穿刺部位观察示意图”。</p>
+<p>保存：</p>
+<pre><code class="language-JSON">{
+  &quot;image_id&quot;: &quot;img_iv_003&quot;,
+  &quot;oss_key&quot;: &quot;oss://medical-textbook/basic_nursing/page_128_img_003.png&quot;,
+  &quot;caption&quot;: &quot;图X-X 静脉输液穿刺部位观察示意图&quot;,
+  &quot;visual_summary&quot;: &quot;该图展示静脉输液过程中护士需要观察穿刺部位是否出现肿胀、疼痛、渗液等异常表现。&quot;,
+  &quot;page_no&quot;: 128,
+  &quot;bbox&quot;: [90, 560, 900, 900],
+  &quot;related_chunk_ids&quot;: [&quot;basic_nursing_vX_ch_iv_008&quot;, &quot;basic_nursing_vX_ch_iv_009&quot;],
+  &quot;knowledge_points&quot;: [&quot;输液过程观察&quot;, &quot;输液外渗&quot;]
+}
+</code></pre>
+<p>检索时不是直接查图片，而是查：</p>
+<pre><code>图X-X 静脉输液穿刺部位观察示意图。该图展示……
+</code></pre>
+<p>命中后再取 OSS 图片。</p>
+<h2>第七步：向量化</h2>
+<p>向量化文本：</p>
+<pre><code>教材：基础护理学
+章节：静脉输液与输血
+知识点：输液外渗的识别与处理
+同义词：局部肿胀、穿刺部位疼痛、液体渗出、针眼附近鼓包
+教学场景：基础护理实训、护士资格证备考、OSCE护理操作考核
+正文：教材原文……
+</code></pre>
+<p>同时建立：</p>
+<ul>
+<li>向量索引；</li>
+<li>全文索引；</li>
+<li>术语索引；</li>
+<li>元数据索引；</li>
+<li>图片索引；</li>
+<li>表格索引。</li>
+</ul>
+<p>不要只做向量检索，建议做：</p>
+<blockquote>
+<p><strong>向量检索 + 关键词检索 + 术语扩展 + rerank 重排。</strong></p>
+</blockquote>
+<h2>第八步：题库关联</h2>
+<p>题目：</p>
+<pre><code>患者静脉输液过程中诉穿刺部位疼痛，局部皮肤肿胀，护士首先应考虑什么情况？
+</code></pre>
+<p>关联：</p>
+<pre><code class="language-JSON">{
+  &quot;question_id&quot;: &quot;q_iv_071&quot;,
+  &quot;knowledge_points&quot;: [&quot;输液外渗&quot;, &quot;输液过程观察&quot;],
+  &quot;evidence_chunk_ids&quot;: [&quot;basic_nursing_vX_ch_iv_009&quot;],
+  &quot;related_image_ids&quot;: [&quot;img_iv_003&quot;],
+  &quot;difficulty&quot;: &quot;中等&quot;,
+  &quot;exam_scene&quot;: &quot;护士资格证 / 校内考试&quot;,
+  &quot;common_wrong_reason&quot;: &quot;学生未能将局部肿胀与输液异常联系起来&quot;
+}
+</code></pre>
+<p>这样做之后，智能辅导智能体就能说：</p>
+<blockquote>
+<p>“这道题考查的是输液外渗识别，不是单纯疼痛处理。教材依据在第X章第X页。”</p>
+</blockquote>
+<h2>第九步：病例关联</h2>
+<p>病例：</p>
+<pre><code>患者在静脉输液 20 分钟后出现穿刺部位疼痛、局部肿胀、滴速变慢。
+</code></pre>
+<p>关联：</p>
+<pre><code class="language-JSON">{
+  &quot;case_id&quot;: &quot;case_iv_001&quot;,
+  &quot;case_type&quot;: &quot;基础护理操作异常处理&quot;,
+  &quot;symptoms&quot;: [&quot;穿刺部位疼痛&quot;, &quot;局部肿胀&quot;, &quot;滴速变慢&quot;],
+  &quot;knowledge_points&quot;: [&quot;输液外渗&quot;, &quot;输液故障处理&quot;, &quot;输液过程观察&quot;],
+  &quot;evidence_chunk_ids&quot;: [
+    &quot;basic_nursing_vX_ch_iv_008&quot;,
+    &quot;basic_nursing_vX_ch_iv_009&quot;,
+    &quot;basic_nursing_vX_ch_iv_011&quot;
+  ]
+}
+</code></pre>
+<p>这就可以支撑：</p>
+<ul>
+<li>虚拟病人；</li>
+<li>护理思维训练；</li>
+<li>情景模拟；</li>
+<li>OSCE 考站；</li>
+<li>实训前预习；</li>
+<li>实训后复盘。</li>
+</ul>
+<h2>第十步：Agent 回答</h2>
+<p>学生问：</p>
+<blockquote>
+<p>“输液的时候针眼附近鼓起来，还疼，是怎么回事？”</p>
+</blockquote>
+<p>系统处理流程：</p>
+<ol>
+<li>识别口语表达：<br />
+“针眼附近鼓起来” → “穿刺部位肿胀” → “可能关联输液外渗”。</li>
+<li>检索：<br />
+命中 <code>chunk_009：输液外渗的识别与处理</code>。</li>
+<li>rerank：<br />
+把“输液外渗”相关 chunk 排到前面。</li>
+<li>生成回答：<br />
+用教材证据回答。</li>
+<li>引用证据：<br />
+引用第X章、第X节、第128页、对应段落和图片。</li>
+</ol>
+<p>这才是一个完整的医学教材 RAG 闭环。</p>
+<hr />
+<h1>十四、真正比别人做得更好的关键在哪里</h1>
+<p>我认为核心竞争力主要在 9 个地方。</p>
+<h2>1. 医学教材解析质量</h2>
+<p>别人可能只是 OCR 出文字。</p>
+<p>您们要做到：</p>
+<ul>
+<li>标题层级正确；</li>
+<li>图文关系正确；</li>
+<li>表格结构正确；</li>
+<li>页码正确；</li>
+<li>图片和图注正确；</li>
+<li>跨页内容正确；</li>
+<li>段落顺序正确；</li>
+<li>可回溯到原始教材页面。</li>
+</ul>
+<h2>2. 医学教育专用切片规则</h2>
+<p>通用 RAG 常按字数切。</p>
+<p>医学教育应该按：</p>
+<ul>
+<li>概念；</li>
+<li>目的；</li>
+<li>适应证；</li>
+<li>禁忌证；</li>
+<li>操作流程；</li>
+<li>注意事项；</li>
+<li>异常处理；</li>
+<li>护理评价；</li>
+<li>健康教育；</li>
+<li>考点；</li>
+<li>病例决策点。</li>
+</ul>
+<p>这套规则本身就是壁垒。</p>
+<h2>3. 术语标准化和同义词体系</h2>
+<p>学生说“鼓包”，教材说“局部肿胀”，专业表达说“输液外渗”。</p>
+<p>能不能把这些统一起来，决定了系统好不好用。</p>
+<h2>4. 题库与教材证据打通</h2>
+<p>普通知识库只能回答问题。</p>
+<p>高质量医学教育知识库可以做到：</p>
+<ul>
+<li>每道题有教材依据；</li>
+<li>每个错题能回到知识点；</li>
+<li>每个知识点能生成题；</li>
+<li>每个章节能看学生薄弱点；</li>
+<li>每个班级能做学情分析。</li>
+</ul>
+<h2>5. 病例与知识点打通</h2>
+<p>这是天堰很重要的优势。</p>
+<p>教材知识点不能只停留在文本问答，要进入：</p>
+<ul>
+<li>AISP 虚拟病人；</li>
+<li>临床思维训练；</li>
+<li>护理思维训练；</li>
+<li>OSCE 考试；</li>
+<li>实训室场景；</li>
+<li>模拟人训练。</li>
+</ul>
+<h2>6. 图表知识化能力</h2>
+<p>医学教材的图表很多，尤其是基础护理、解剖、生理、病理、临床技能类教材。</p>
+<p>如果只做正文 embedding，会损失大量知识。</p>
+<h2>7. 证据引用和可信追溯</h2>
+<p>学校和医院不会接受一个“说得很像但不知道依据哪里”的系统。</p>
+<p>能做到“点击答案 → 回到教材原页 → 高亮原文段落”，这就是产品级能力。</p>
+<h2>8. 评测集和回归测试</h2>
+<p>谁有标准评测集，谁就能持续优化。</p>
+<p>每次换 embedding、换 reranker、换切片策略，都要跑评测。</p>
+<p>没有评测，就只能靠感觉。</p>
+<h2>9. 教学闭环数据</h2>
+<p>最终不是做一个知识库，而是形成：</p>
+<blockquote>
+<p>学生提问 → 教材知识点 → 题库训练 → 病例训练 → 实训评价 → 学情分析 → 教师改进 → 知识库迭代</p>
+</blockquote>
+<p>这才是医学教育企业的系统性壁垒。</p>
+<hr />
+<h1>十五、我建议的产品技术路线</h1>
+<p>可以分三期建设。</p>
+<h2>第一期：教材 RAG 基础能力</h2>
+<p>目标：让基础护理学教材可以被准确检索、引用、问答。</p>
+<p>重点做：</p>
+<ul>
+<li>MinerU 解析；</li>
+<li>教材结构化；</li>
+<li>知识点切片；</li>
+<li>OSS 图片管理；</li>
+<li>embedding 入库；</li>
+<li>混合检索；</li>
+<li>引用页码和原文；</li>
+<li>100–300 个标准评测问题。</li>
+</ul>
+<h2>第二期：题库和病例关联</h2>
+<p>目标：把教材知识变成教学能力。</p>
+<p>重点做：</p>
+<ul>
+<li>题库知识点标注；</li>
+<li>题目与教材证据关联；</li>
+<li>病例与知识点关联；</li>
+<li>操作流程和 OSCE 考点关联；</li>
+<li>智能辅导智能体调用；</li>
+<li>教师备课智能体调用；</li>
+<li>学情分析看板。</li>
+</ul>
+<h2>第三期：医学教育知识图谱与持续进化</h2>
+<p>目标：形成天堰医学教育知识资产。</p>
+<p>重点做：</p>
+<ul>
+<li>术语库；</li>
+<li>知识点图谱；</li>
+<li>教材版本管理；</li>
+<li>多教材对比；</li>
+<li>跨课程知识关联；</li>
+<li>学生错题与知识点映射；</li>
+<li>教师修订反馈；</li>
+<li>自动评测与回归测试；</li>
+<li>多专业扩展：护理、临床、康复、中医、急救、规培。</li>
+</ul>
+<hr />
+<h1>十六、最关键的一句话</h1>
+<p>这件事的本质不是：</p>
+<blockquote>
+<p>“把教材 embedding 到向量数据库。”</p>
+</blockquote>
+<p>而是：</p>
+<blockquote>
+<p><strong>把医学教材加工成可被 Agent 调用、可被教师信任、可被学生学习、可被题库和病例复用、可被教学评价闭环验证的医学教育知识资产。</strong></p>
+</blockquote>
+<p>真正做得比别人好的地方，不在 embedding 模型本身，而在：</p>
+<blockquote>
+<p><strong>医学教育知识工程方法论 + 数据结构设计 + 证据引用体系 + 题库病例关联 + 教学闭环评测。</strong></p>
+</blockquote>
+<p>这才是天堰应该沉淀的核心竞争力。</p>
+<hr />
+<p><strong>You:</strong></p>
+<p>这里面我有个问题。就是知识图谱的问题。我是否应该把教材做成知识库之后，再通过知识库来去构建知识图谱、能力图谱或者各类图谱，然后再把。题库和病例跟图谱进行关联，从而更好的去实现与知识库之间关联呢。另外还有一点是知识图谱是不是先构建，然后通过知识图谱来去构建知识库，这样子知识库的构建会更加好呢？这两项工作的先后顺序是怎么样的？我同意你说到的第1期先把教材的rag基础能力先做好，然后再做题库的和病例的关联。但是在做第1期，把教材的rag基础能力做好这个过程。你提到的第4步知识点切分。这个过程是通过AI来做，还是通过人来做，对于我个人而言，尽可能的把工作都是通过AI去做，我选用一个足够聪明的AI模型。通过提示词的控制来实现这项工作的落地。让AI去完成知识点的切分，术语标准化。图片处理等等这些相关的工作。这个是否可行？这里面如果都用AI去做的话，估计也会产生一些费用。我想你继续把刚刚的案例，基础护理学静脉输液这个章节的例子，帮我估计一下。这些工作通过AI去做应该怎么去完成？相关的费用估计是多少？我希望选用更加聪明的模型，比如说 ChatGPT 5.5. Claude opus 4.7 我希望用目前最好的模型来帮我处理这些工作提高准确率。我想你给点意见。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<p>我会把这个问题拆成两条线：一条是“知识库与知识图谱的先后关系”，另一条是“用最强模型自动完成知识点切分、术语标准化、图片处理的可行性与费用”。关键点是：AI 可以做 80%–90% 的生产工作，但必须有规则、抽检和评测闭环。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<p>先给一个战略判断：知识图谱不要等到知识库全部做完才想，也不要一开始就重资产建设完整图谱。正确路线是“先定义图谱骨架，再做教材知识库；边入库边抽取关系，最后形成正式图谱”。</p>
+<hr />
+<p><strong>ChatGPT:</strong></p>
+<h2>先给结论</h2>
+<p>您的判断是对的：<strong>长期来看，真正高质量的医学教材 RAG，一定不能只停留在“文本切片 + embedding + 向量检索”，必须逐步升级为“知识库 + 知识图谱 + 能力图谱 + 题库图谱 + 病例图谱”的组合体系。</strong></p>
+<p>但先后顺序不能搞反。</p>
+<p>我建议采用这条路线：</p>
+<blockquote>
+<p><strong>先设计图谱骨架 → 再建设教材 RAG 知识库 → 入库过程中同步抽取知识点和关系 → 再逐步沉淀知识图谱、能力图谱、题库图谱、病例图谱。</strong></p>
+</blockquote>
+<p>也就是说：</p>
+<blockquote>
+<p><strong>不是先完整建设知识图谱再做知识库，也不是先完全不管图谱只做知识库，而是“图谱框架先行，知识库建设先落地，图谱能力渐进生成”。</strong></p>
+</blockquote>
+<p>这条路线最适合天堰：既能快速做出可用的教材 RAG，又不会让后期知识图谱返工。</p>
+<hr />
+<h1>一、知识库和知识图谱的先后关系</h1>
+<h2>1. 不建议一开始就完整建设知识图谱</h2>
+<p>如果一开始就说“我要先把《基础护理学》做成完整知识图谱”，很容易陷入几个问题：</p>
+<p>第一，工程量巨大。<br />
+一本教材里有章节、概念、操作流程、注意事项、并发症、护理措施、图表、题目、病例、能力目标，全部人工或半自动整理成图谱，周期会很长。</p>
+<p>第二，图谱容易脱离真实检索场景。<br />
+图谱做得很漂亮，但学生真实提问时，系统还是要回到教材原文、页码、段落、图片证据。如果没有 RAG 知识库做底座，图谱会变成“概念关系展示系统”，而不是“可回答问题的教学智能体底座”。</p>
+<p>第三，医学教材存在大量表述性知识。<br />
+例如“输液过程中应观察穿刺部位有无肿胀、疼痛、渗液”等内容，既是文本知识，也是操作要点。它不一定一开始就适合抽成非常规范的图谱三元组。</p>
+<p>所以，<strong>完整知识图谱不能放在第一步。</strong></p>
+<hr />
+<h2>2. 也不建议先完全不考虑图谱</h2>
+<p>反过来，如果第一期只做：</p>
+<blockquote>
+<p>OCR → 切片 → embedding → 向量库</p>
+</blockquote>
+<p>后面再想加知识图谱，会遇到大返工：</p>
+<ul>
+<li>chunk 没有标准知识点 ID；</li>
+<li>章节结构没有稳定编码；</li>
+<li>图片和正文没有关联；</li>
+<li>题库无法挂接到知识点；</li>
+<li>病例无法挂接到操作流程；</li>
+<li>学生错题无法汇总到能力维度；</li>
+<li>后期无法做知识点掌握度分析。</li>
+</ul>
+<p>所以第一期即使不建设完整知识图谱，也必须让每个知识 chunk <strong>天然具备图谱化能力</strong>。</p>
+<hr />
+<h1>二、正确路线：图谱骨架先行，RAG知识库先落地</h1>
+<p>我建议把图谱分成三种状态。</p>
+<h2>第一种：图谱骨架</h2>
+<p>这是第一期就要设计的。</p>
+<p>它不是完整知识图谱，而是定义清楚：</p>
+<ul>
+<li>有哪些节点类型；</li>
+<li>有哪些关系类型；</li>
+<li>每个知识点如何编号；</li>
+<li>每个 chunk 如何挂接知识点；</li>
+<li>每道题如何挂接知识点；</li>
+<li>每个病例如何挂接知识点；</li>
+<li>每个能力点如何挂接教学任务。</li>
+</ul>
+<p>例如《基础护理学》可以先定义这些节点：</p>
+<table>
+<thead>
+<tr>
+<th>节点类型</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>教材</td>
+<td>基础护理学</td>
+</tr>
+<tr>
+<td>章</td>
+<td>静脉输液与输血</td>
+</tr>
+<tr>
+<td>节</td>
+<td>静脉输液</td>
+</tr>
+<tr>
+<td>知识点</td>
+<td>输液外渗的识别与处理</td>
+</tr>
+<tr>
+<td>术语</td>
+<td>输液外渗、局部肿胀、静脉炎</td>
+</tr>
+<tr>
+<td>操作步骤</td>
+<td>核对、排气、穿刺、固定、调速、观察、记录</td>
+</tr>
+<tr>
+<td>能力点</td>
+<td>操作规范能力、异常识别能力、护理判断能力</td>
+</tr>
+<tr>
+<td>图片</td>
+<td>静脉输液穿刺部位观察示意图</td>
+</tr>
+<tr>
+<td>表格</td>
+<td>常见输液故障及处理表</td>
+</tr>
+<tr>
+<td>题目</td>
+<td>护士资格证相关题</td>
+</tr>
+<tr>
+<td>病例</td>
+<td>输液过程中局部肿胀案例</td>
+</tr>
+</tbody>
+</table>
+<p>再定义关系：</p>
+<table>
+<thead>
+<tr>
+<th>关系类型</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>属于</td>
+<td>输液外渗 属于 静脉输液</td>
+</tr>
+<tr>
+<td>包含</td>
+<td>静脉输液 包含 操作前评估</td>
+</tr>
+<tr>
+<td>前置知识</td>
+<td>静脉解剖 是 静脉输液穿刺 的前置知识</td>
+</tr>
+<tr>
+<td>易混淆</td>
+<td>输液外渗 易混淆 静脉炎</td>
+</tr>
+<tr>
+<td>考查</td>
+<td>题目 q001 考查 输液外渗</td>
+</tr>
+<tr>
+<td>应用于</td>
+<td>输液外渗 应用于 病例 case001</td>
+</tr>
+<tr>
+<td>支撑</td>
+<td>chunk009 支撑 知识点“输液外渗”</td>
+</tr>
+<tr>
+<td>图示说明</td>
+<td>图片 img003 图示说明 输液过程观察</td>
+</tr>
+</tbody>
+</table>
+<p>这就是第一期必须先设计的“图谱骨架”。</p>
+<hr />
+<h2>第二种：图谱候选数据</h2>
+<p>教材 RAG 建设过程中，让 AI 自动抽取：</p>
+<ul>
+<li>知识点；</li>
+<li>术语；</li>
+<li>同义词；</li>
+<li>上下位关系；</li>
+<li>前后置关系；</li>
+<li>易混淆关系；</li>
+<li>操作流程关系；</li>
+<li>题库关联候选；</li>
+<li>病例关联候选。</li>
+</ul>
+<p>这些先不要全部当成正式知识图谱，而是作为 <strong>候选关系</strong> 保存。</p>
+<p>例如：</p>
+<pre><code class="language-JSON">{
+  &quot;source_id&quot;: &quot;kp_iv_009&quot;,
+  &quot;source_name&quot;: &quot;输液外渗的识别与处理&quot;,
+  &quot;relation&quot;: &quot;易混淆&quot;,
+  &quot;target_id&quot;: &quot;kp_iv_010&quot;,
+  &quot;target_name&quot;: &quot;静脉炎的观察与护理&quot;,
+  &quot;confidence&quot;: 0.82,
+  &quot;evidence_chunk_ids&quot;: [&quot;basic_nursing_iv_chunk_009&quot;, &quot;basic_nursing_iv_chunk_010&quot;],
+  &quot;status&quot;: &quot;candidate&quot;
+}
+</code></pre>
+<p>这样做的好处是：AI 可以大规模生产，但系统不盲目信任 AI。</p>
+<hr />
+<h2>第三种：正式知识图谱</h2>
+<p>当候选关系经过以下环节后，再进入正式图谱：</p>
+<ul>
+<li>规则校验；</li>
+<li>AI 二次复核；</li>
+<li>抽样人工审核；</li>
+<li>真实问答评测验证；</li>
+<li>题库和病例使用验证。</li>
+</ul>
+<p>正式图谱才用于：</p>
+<ul>
+<li>学生学习路径推荐；</li>
+<li>知识点掌握度分析；</li>
+<li>题目推荐；</li>
+<li>病例推荐；</li>
+<li>教师备课；</li>
+<li>课程诊改；</li>
+<li>能力画像。</li>
+</ul>
+<p>所以先后顺序应该是：</p>
+<blockquote>
+<p><strong>图谱骨架设计 → 教材知识库建设 → AI抽取图谱候选 → 评测验证 → 正式图谱沉淀 → 题库病例深度挂接。</strong></p>
+</blockquote>
+<hr />
+<h1>三、第一期做教材 RAG 时，知识点切分能不能由 AI 来做？</h1>
+<p>可以，而且应该主要由 AI 来做。</p>
+<p>但不能简单理解为：</p>
+<blockquote>
+<p>“把教材丢给大模型，让它帮我切。”</p>
+</blockquote>
+<p>正确做法是：</p>
+<blockquote>
+<p><strong>人定义规则和标准，AI 执行批量加工，系统做自动校验，人只做抽检和疑难复核。</strong></p>
+</blockquote>
+<p>这才符合您“能让机器做的不要让人做”的方向。</p>
+<h2>人主要做什么？</h2>
+<p>人不应该逐段切教材。人应该做四件事：</p>
+<ol>
+<li>定义切片规则；</li>
+<li>定义知识点 schema；</li>
+<li>做第一章或第一节的标杆样本；</li>
+<li>抽检 AI 输出质量。</li>
+</ol>
+<h2>AI 主要做什么？</h2>
+<p>AI 可以承担：</p>
+<ul>
+<li>章节结构识别；</li>
+<li>知识点切分；</li>
+<li>chunk 标题生成；</li>
+<li>chunk 摘要生成；</li>
+<li>术语抽取；</li>
+<li>同义词生成；</li>
+<li>图文关联；</li>
+<li>图片说明生成；</li>
+<li>表格结构化；</li>
+<li>能力点标注；</li>
+<li>题库关联候选；</li>
+<li>病例关联候选；</li>
+<li>图谱关系候选；</li>
+<li>质量自检。</li>
+</ul>
+<p>我的建议是：<strong>AI 做 90%，人做 10% 的规则制定和质量验收。</strong></p>
+<hr />
+<h1>四、不要用一个大提示词做完，要拆成多个 AI 工序</h1>
+<p>这件事不能用一个超级提示词完成，必须拆成流水线。</p>
+<p>以“基础护理学—静脉输液”章节为例，建议拆成 8 个 AI 工序。</p>
+<hr />
+<h2>工序 1：章节结构还原</h2>
+<p>输入：</p>
+<ul>
+<li>MinerU 输出的 JSON；</li>
+<li>每页 OCR 文本；</li>
+<li>标题、段落、图片、表格；</li>
+<li>页码和版面位置。</li>
+</ul>
+<p>AI 任务：</p>
+<ul>
+<li>判断章节标题；</li>
+<li>判断一级、二级、三级标题；</li>
+<li>修复 OCR 造成的标题错位；</li>
+<li>删除页眉页脚；</li>
+<li>合并跨页段落；</li>
+<li>建立章节树。</li>
+</ul>
+<p>输出：</p>
+<pre><code class="language-JSON">{
+  &quot;chapter&quot;: &quot;静脉输液与输血&quot;,
+  &quot;sections&quot;: [
+    {
+      &quot;section_title&quot;: &quot;静脉输液&quot;,
+      &quot;subsections&quot;: [
+        &quot;静脉输液的目的&quot;,
+        &quot;静脉输液常用溶液&quot;,
+        &quot;静脉输液操作流程&quot;,
+        &quot;输液过程中的观察与护理&quot;,
+        &quot;常见输液故障及处理&quot;,
+        &quot;常见输液反应及护理&quot;
+      ]
+    }
+  ]
+}
+</code></pre>
+<p>这个环节的目标是：<strong>把教材从版面结构变成教学结构。</strong></p>
+<hr />
+<h2>工序 2：知识点切分</h2>
+<p>AI 按规则切分知识点。</p>
+<p>规则不是“每 500 字一段”，而是按医学教育语义切：</p>
+<ul>
+<li>一个概念一个 chunk；</li>
+<li>一个操作阶段一个 chunk；</li>
+<li>一个异常处理一个 chunk；</li>
+<li>一个表格主题一个 chunk；</li>
+<li>一个图片说明一个 chunk；</li>
+<li>一个考试常考点一个 chunk。</li>
+</ul>
+<p>例如静脉输液章节可以切成：</p>
+<pre><code class="language-JSON">[
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_001&quot;,
+    &quot;knowledge_point_name&quot;: &quot;静脉输液的概念&quot;,
+    &quot;chunk_type&quot;: &quot;概念类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_002&quot;,
+    &quot;knowledge_point_name&quot;: &quot;静脉输液的目的&quot;,
+    &quot;chunk_type&quot;: &quot;目的类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_003&quot;,
+    &quot;knowledge_point_name&quot;: &quot;静脉输液操作前评估&quot;,
+    &quot;chunk_type&quot;: &quot;操作流程类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_004&quot;,
+    &quot;knowledge_point_name&quot;: &quot;静脉输液穿刺与固定&quot;,
+    &quot;chunk_type&quot;: &quot;操作流程类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_005&quot;,
+    &quot;knowledge_point_name&quot;: &quot;输液速度调节&quot;,
+    &quot;chunk_type&quot;: &quot;操作要点类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_006&quot;,
+    &quot;knowledge_point_name&quot;: &quot;输液过程观察&quot;,
+    &quot;chunk_type&quot;: &quot;观察护理类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_007&quot;,
+    &quot;knowledge_point_name&quot;: &quot;输液外渗的识别与处理&quot;,
+    &quot;chunk_type&quot;: &quot;异常处理类&quot;
+  },
+  {
+    &quot;knowledge_point_id&quot;: &quot;BN_IV_008&quot;,
+    &quot;knowledge_point_name&quot;: &quot;静脉炎的观察与护理&quot;,
+    &quot;chunk_type&quot;: &quot;并发症类&quot;
+  }
+]
+</code></pre>
+<p>这里 AI 可以完成 80% 以上，但需要系统自动检查：</p>
+<ul>
+<li>是否漏掉标题；</li>
+<li>是否把两个不同知识点混在一起；</li>
+<li>是否把同一个知识点重复切分；</li>
+<li>是否每个 chunk 都有来源页码；</li>
+<li>是否每个 chunk 都有原文证据。</li>
+</ul>
+<hr />
+<h2>工序 3：术语标准化</h2>
+<p>AI 从每个知识点里抽取术语。</p>
+<p>例如：</p>
+<pre><code class="language-JSON">{
+  &quot;standard_term&quot;: &quot;输液外渗&quot;,
+  &quot;aliases&quot;: [
+    &quot;液体外渗&quot;,
+    &quot;穿刺部位肿胀&quot;,
+    &quot;局部肿胀&quot;,
+    &quot;针眼附近鼓包&quot;,
+    &quot;输液部位疼痛&quot;,
+    &quot;液体渗出&quot;
+  ],
+  &quot;term_type&quot;: &quot;护理操作异常&quot;,
+  &quot;related_terms&quot;: [
+    &quot;静脉输液&quot;,
+    &quot;静脉炎&quot;,
+    &quot;输液故障&quot;,
+    &quot;穿刺失败&quot;
+  ],
+  &quot;related_knowledge_point_id&quot;: &quot;BN_IV_007&quot;
+}
+</code></pre>
+<p>术语标准化的核心价值是：<strong>把教材语言、学生口语、考试语言、临床语言打通。</strong></p>
+<p>例如：</p>
+<ul>
+<li>教材说：液体外渗；</li>
+<li>学生说：针眼鼓起来；</li>
+<li>题目说：局部肿胀疼痛；</li>
+<li>临床说：穿刺部位异常；</li>
+<li>系统标准知识点：输液外渗。</li>
+</ul>
+<p>这个工作非常适合 AI 做，但要建立“标准术语库”。第一期可以先让 AI 生成候选术语库，后期再由专家抽检、固化。</p>
+<hr />
+<h2>工序 4：图谱关系抽取</h2>
+<p>AI 对知识点之间建立关系。</p>
+<p>例如：</p>
+<pre><code class="language-JSON">[
+  {
+    &quot;source&quot;: &quot;静脉输液操作前评估&quot;,
+    &quot;relation&quot;: &quot;前置于&quot;,
+    &quot;target&quot;: &quot;静脉输液穿刺与固定&quot;,
+    &quot;confidence&quot;: 0.91
+  },
+  {
+    &quot;source&quot;: &quot;输液过程观察&quot;,
+    &quot;relation&quot;: &quot;包含&quot;,
+    &quot;target&quot;: &quot;输液外渗的识别与处理&quot;,
+    &quot;confidence&quot;: 0.88
+  },
+  {
+    &quot;source&quot;: &quot;输液外渗&quot;,
+    &quot;relation&quot;: &quot;易混淆&quot;,
+    &quot;target&quot;: &quot;静脉炎&quot;,
+    &quot;confidence&quot;: 0.76
+  },
+  {
+    &quot;source&quot;: &quot;输液外渗&quot;,
+    &quot;relation&quot;: &quot;需要采取&quot;,
+    &quot;target&quot;: &quot;停止或调整输液并报告处理&quot;,
+    &quot;confidence&quot;: 0.82
+  }
+]
+</code></pre>
+<p>注意：这些关系第一阶段不要直接当“权威图谱”，而是作为候选图谱。</p>
+<hr />
+<h2>工序 5：图片处理</h2>
+<p>您现在的方式是图片放到阿里云 OSS，通过 ID 检索后再拿图片地址。这个方向正确，但图片不能只有 OSS 地址。</p>
+<p>AI 要给每张图片生成结构化信息：</p>
+<pre><code class="language-JSON">{
+  &quot;image_id&quot;: &quot;BN_IV_IMG_003&quot;,
+  &quot;oss_key&quot;: &quot;oss://textbook/basic_nursing/iv/page_128_img_003.png&quot;,
+  &quot;image_type&quot;: &quot;操作示意图&quot;,
+  &quot;caption_original&quot;: &quot;图X-X 静脉输液穿刺部位观察示意图&quot;,
+  &quot;visual_summary&quot;: &quot;该图展示静脉输液过程中穿刺部位的观察重点，包括局部皮肤状态、肿胀、疼痛、渗液等异常表现。&quot;,
+  &quot;related_knowledge_points&quot;: [
+    &quot;输液过程观察&quot;,
+    &quot;输液外渗的识别与处理&quot;
+  ],
+  &quot;related_chunk_ids&quot;: [
+    &quot;BN_IV_CHUNK_006&quot;,
+    &quot;BN_IV_CHUNK_007&quot;
+  ],
+  &quot;page_no&quot;: 128,
+  &quot;bbox&quot;: [120, 520, 860, 900]
+}
+</code></pre>
+<p>真正入向量库的不是图片文件本身，而是：</p>
+<ul>
+<li>原始图注；</li>
+<li>图片 AI 说明；</li>
+<li>图片关联正文；</li>
+<li>图片关联知识点；</li>
+<li>图片教学用途描述。</li>
+</ul>
+<p>用户问到“输液局部肿胀怎么看”，系统先检索到相关图像说明，再通过 <code>image_id</code> 获取 OSS 图片。</p>
+<hr />
+<h2>工序 6：能力点标注</h2>
+<p>这一步非常重要，是能力图谱的基础。</p>
+<p>例如“输液外渗的识别与处理”可以标注为：</p>
+<pre><code class="language-JSON">{
+  &quot;knowledge_point&quot;: &quot;输液外渗的识别与处理&quot;,
+  &quot;competencies&quot;: [
+    {
+      &quot;competency_name&quot;: &quot;异常识别能力&quot;,
+      &quot;level&quot;: &quot;核心能力&quot;
+    },
+    {
+      &quot;competency_name&quot;: &quot;护理判断能力&quot;,
+      &quot;level&quot;: &quot;核心能力&quot;
+    },
+    {
+      &quot;competency_name&quot;: &quot;操作安全意识&quot;,
+      &quot;level&quot;: &quot;基础能力&quot;
+    },
+    {
+      &quot;competency_name&quot;: &quot;护理记录能力&quot;,
+      &quot;level&quot;: &quot;支持能力&quot;
+    }
+  ]
+}
+</code></pre>
+<p>这会直接支撑后面的：</p>
+<ul>
+<li>学生能力画像；</li>
+<li>实训评价；</li>
+<li>OSCE 评分；</li>
+<li>错题归因；</li>
+<li>个性化学习路径。</li>
+</ul>
+<hr />
+<h2>工序 7：生成 embedding 文本</h2>
+<p>不要直接把原文裸文本 embedding。建议生成一个“检索增强文本”。</p>
+<p>例如：</p>
+<pre><code>教材：基础护理学
+章节：静脉输液与输血
+小节：静脉输液
+知识点：输液外渗的识别与处理
+知识类型：异常处理类
+同义表达：液体外渗、局部肿胀、穿刺部位肿胀、针眼鼓包、输液部位疼痛、液体渗出
+教学场景：基础护理实训、护士资格证备考、OSCE护理操作考核
+能力点：异常识别能力、护理判断能力、操作安全意识
+关联图片：静脉输液穿刺部位观察示意图
+原文：……
+</code></pre>
+<p>这就是比别人做得好的地方。</p>
+<p>普通公司可能只是：</p>
+<blockquote>
+<p>原文 → embedding</p>
+</blockquote>
+<p>天堰应该做：</p>
+<blockquote>
+<p>原文 + 教材结构 + 知识点 + 术语 + 同义词 + 能力点 + 图片关系 + 教学场景 → embedding</p>
+</blockquote>
+<hr />
+<h2>工序 8：质量评测</h2>
+<p>AI 加工完成后，要自动生成评测题。</p>
+<p>例如：</p>
+<pre><code class="language-JSON">[
+  {
+    &quot;question&quot;: &quot;输液过程中穿刺部位出现局部肿胀和疼痛，可能提示什么问题？&quot;,
+    &quot;expected_knowledge_point&quot;: &quot;输液外渗的识别与处理&quot;,
+    &quot;expected_chunk_id&quot;: &quot;BN_IV_CHUNK_007&quot;
+  },
+  {
+    &quot;question&quot;: &quot;静脉输液操作前为什么要核对患者信息？&quot;,
+    &quot;expected_knowledge_point&quot;: &quot;静脉输液操作前评估与核对&quot;,
+    &quot;expected_chunk_id&quot;: &quot;BN_IV_CHUNK_003&quot;
+  }
+]
+</code></pre>
+<p>然后用这些问题反向测试：</p>
+<ul>
+<li>能不能召回正确 chunk；</li>
+<li>能不能引用正确页码；</li>
+<li>能不能给出符合教材的回答；</li>
+<li>有没有胡编；</li>
+<li>有没有把相似知识点混淆。</li>
+</ul>
+<p>这一步不是可选项，是产品质量护城河。</p>
+<hr />
+<h1>五、全部用 AI 做是否可行？</h1>
+<h2>可以，但必须是“AI流水线”，不是“AI自由发挥”</h2>
+<p>可行的前提有 5 个：</p>
+<p>第一，必须有结构化输入。<br />
+MinerU 输出后，最好使用 JSON，而不是只给 AI 一大段 Markdown。</p>
+<p>第二，必须有严格 JSON Schema。<br />
+AI 每一步都必须输出固定结构，方便程序校验。</p>
+<p>第三，必须有置信度字段。<br />
+例如每个知识点、关系、术语都给 <code>confidence</code>，低置信度进入复核队列。</p>
+<p>第四，必须有自动质检规则。<br />
+例如 chunk 没有页码、没有原文证据、没有知识点 ID，就不能入库。</p>
+<p>第五，必须有抽样人工验收。<br />
+不是让人做生产，而是让人做质量控制。</p>
+<p>所以结论是：</p>
+<blockquote>
+<p><strong>AI 可以做主生产力，但系统规则、数据结构、评测集和质量门禁必须由我们设计。</strong></p>
+</blockquote>
+<hr />
+<h1>六、用最强模型是否值得？</h1>
+<p>我的观点很明确：</p>
+<blockquote>
+<p><strong>不要用最强模型处理所有内容。应该用最强模型做标准制定、疑难样本、质量审查和评测裁判；批量生产用次一级高性价比模型。</strong></p>
+</blockquote>
+<p>原因很简单：教材知识工程是批处理任务，不是每一步都需要最强推理模型。</p>
+<h2>推荐模型分工</h2>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>推荐模型策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>制定切片规则</td>
+<td>GPT-5.5 / Claude Opus 级别</td>
+</tr>
+<tr>
+<td>第一章标杆样本</td>
+<td>GPT-5.5 / Claude Opus 级别</td>
+</tr>
+<tr>
+<td>章节结构识别</td>
+<td>Sonnet / GPT-5.4 / 国内强模型</td>
+</tr>
+<tr>
+<td>大批量知识点切分</td>
+<td>Sonnet / GPT-5.4 / GPT-5 mini 级别</td>
+</tr>
+<tr>
+<td>术语抽取</td>
+<td>Sonnet / GPT-5.4 / 国内模型</td>
+</tr>
+<tr>
+<td>图片解释</td>
+<td>强多模态模型，疑难图用 GPT-5.5</td>
+</tr>
+<tr>
+<td>图谱关系抽取</td>
+<td>Sonnet 级别即可，疑难关系用 GPT-5.5 复核</td>
+</tr>
+<tr>
+<td>质量抽检</td>
+<td>GPT-5.5 / Claude Opus 级别</td>
+</tr>
+<tr>
+<td>最终评测裁判</td>
+<td>GPT-5.5 / Claude Opus 级别</td>
+</tr>
+</tbody>
+</table>
+<p>OpenAI 当前官方价格显示，GPT-5.5 输入为 <strong>$5 / 百万 token</strong>、缓存输入 <strong>$0.5 / 百万 token</strong>、输出 <strong>$30 / 百万 token</strong>；其模型文档还显示上下文窗口为 <strong>1,050,000 token</strong>，但超过 272K 输入 token 的请求会有额外倍率，因此不建议把整本书一次性塞进一个请求处理。<a href="https://openai.com/api/pricing/?utm_source=chatgpt.com">OpenAI+1</a></p>
+<p>Anthropic 官方文档目前列出的 API 价格中，Claude Opus 4.1 为 <strong>$15 / 百万输入 token、$75 / 百万输出 token</strong>，Claude Sonnet 4.5 为 <strong>$3 / 百万输入 token、$15 / 百万输出 token</strong>，Claude Haiku 4.5 为 <strong>$1 / 百万输入 token、$5 / 百万输出 token</strong>；我没有在官方价格文档中看到“Claude Opus 4.7”的正式 API 价格条目，因此如果第三方平台声称提供 Opus 4.7，应要求确认官方模型 ID、官方计费和数据合规条款。<a href="https://docs.claude.com/zh-CN/docs/about-claude/pricing?utm_source=chatgpt.com">Claude API Docs</a></p>
+<hr />
+<h1>七、以“基础护理学—静脉输液”章节估算 AI 加工费用</h1>
+<p>下面做一个工程估算。具体费用要看章节页数、图片数量、OCR质量和返工次数。</p>
+<h2>假设条件</h2>
+<p>假设“静脉输液”相关章节：</p>
+<ul>
+<li>约 25–35 页；</li>
+<li>OCR 后文本约 6–10 万中文字符；</li>
+<li>折算为 8–12 万 token；</li>
+<li>图片、表格、流程图约 8–15 个；</li>
+<li>每个图片解释、关联、结构化平均消耗 1000–3000 input token；</li>
+<li>每个章节需要多轮处理：结构识别、切片、术语、图谱关系、图片解释、质量检查。</li>
+</ul>
+<p>综合估计：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>估算 input token</th>
+<th>估算 output token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>章节结构还原</td>
+<td>80K</td>
+<td>8K</td>
+</tr>
+<tr>
+<td>知识点切分</td>
+<td>120K</td>
+<td>30K</td>
+</tr>
+<tr>
+<td>术语标准化</td>
+<td>80K</td>
+<td>15K</td>
+</tr>
+<tr>
+<td>图谱关系抽取</td>
+<td>70K</td>
+<td>12K</td>
+</tr>
+<tr>
+<td>图片解释与图文关联</td>
+<td>40K</td>
+<td>10K</td>
+</tr>
+<tr>
+<td>质量审查与修正</td>
+<td>60K</td>
+<td>12K</td>
+</tr>
+<tr>
+<td>合计</td>
+<td><strong>450K</strong></td>
+<td><strong>87K</strong></td>
+</tr>
+</tbody>
+</table>
+<p>这是一个相对完整的“高质量加工”估算。</p>
+<hr />
+<h2>如果全部用 GPT-5.5</h2>
+<p>按 GPT-5.5 <strong>$5 / 百万 input token</strong>、<strong>$30 / 百万 output token</strong>计算：</p>
+<ul>
+<li>input：0.45 × 5 = <strong>$2.25</strong></li>
+<li>output：0.087 × 30 = <strong>$2.61</strong></li>
+<li>合计：约 <strong>$4.86 / 章节</strong></li>
+</ul>
+<p>考虑重试、质检、提示词开销、图片复杂度和返工，实际可以按 <strong>$10–20 / 章节</strong> 预留。</p>
+<p>如果一本书按 20 个章节计算：</p>
+<ul>
+<li>理想批处理：约 <strong>$100 左右</strong></li>
+<li>工程化高质量处理：约 <strong>$200–500</strong></li>
+<li>如果大量使用最强模型反复审查：可能到 <strong>$800–1500</strong></li>
+</ul>
+<p>这个费用相对于医学教育产品价值来说并不高。</p>
+<hr />
+<h2>如果全部用 Claude Opus 4.1 级别</h2>
+<p>按官方 Claude Opus 4.1 <strong>$15 / 百万 input token</strong>、<strong>$75 / 百万 output token</strong>计算：</p>
+<ul>
+<li>input：0.45 × 15 = <strong>$6.75</strong></li>
+<li>output：0.087 × 75 = <strong>$6.53</strong></li>
+<li>合计：约 <strong>$13.28 / 章节</strong></li>
+</ul>
+<p>考虑重试和返工，实际可按 <strong>$25–50 / 章节</strong> 预留。</p>
+<p>一本书 20 个章节：</p>
+<ul>
+<li>工程化处理大概 <strong>$500–1000</strong></li>
+<li>如果每一步都用 Opus 级模型，可能更高。</li>
+</ul>
+<hr />
+<h2>如果用 Sonnet 4.5 批量处理</h2>
+<p>按 Claude Sonnet 4.5 <strong>$3 / 百万 input token</strong>、<strong>$15 / 百万 output token</strong>计算：</p>
+<ul>
+<li>input：0.45 × 3 = <strong>$1.35</strong></li>
+<li>output：0.087 × 15 = <strong>$1.31</strong></li>
+<li>合计：约 <strong>$2.66 / 章节</strong></li>
+</ul>
+<p>考虑重试和质检，实际可按 <strong>$5–15 / 章节</strong> 预留。</p>
+<p>这就是为什么我不建议所有环节都用最强模型。</p>
+<hr />
+<h1>八、我建议的最优成本质量组合</h1>
+<h2>第一阶段：做“标杆章节”</h2>
+<p>先拿《基础护理学》“静脉输液”章节做标杆。</p>
+<p>使用最强模型：</p>
+<ul>
+<li>GPT-5.5；</li>
+<li>Claude Opus 级别；</li>
+<li>再加一个国产强模型做对照。</li>
+</ul>
+<p>目标不是省钱，而是把标准打出来：</p>
+<ul>
+<li>切片规则；</li>
+<li>术语规范；</li>
+<li>图文关联规则；</li>
+<li>图谱关系规则；</li>
+<li>输出 JSON Schema；</li>
+<li>评测题集；</li>
+<li>质量标准。</li>
+</ul>
+<p>这一步花 <strong>几百元人民币</strong> 都值得。</p>
+<hr />
+<h2>第二阶段：批量加工全书</h2>
+<p>全书批量加工时，不要全部用最强模型。</p>
+<p>建议：</p>
+<ul>
+<li>80% 批量任务：Sonnet 4.5 / GPT-5.4 / 国产强模型；</li>
+<li>15% 质量复核：GPT-5.5；</li>
+<li>5% 疑难问题：GPT-5.5 + 人工专家确认。</li>
+</ul>
+<p>这样整体质量和成本最平衡。</p>
+<hr />
+<h2>第三阶段：建立自动回归评测</h2>
+<p>每处理完一个章节，就自动生成：</p>
+<ul>
+<li>20 个知识点问答；</li>
+<li>10 个操作流程题；</li>
+<li>10 个异常处理题；</li>
+<li>5 个图表理解题；</li>
+<li>5 个病例应用题；</li>
+<li>5 个易混淆概念题。</li>
+</ul>
+<p>这些题反过来测试知识库。</p>
+<p>如果检索不到正确 chunk，说明：</p>
+<ul>
+<li>切片有问题；</li>
+<li>术语标准化有问题；</li>
+<li>embedding 文本模板有问题；</li>
+<li>图谱关系有问题；</li>
+<li>rerank 有问题。</li>
+</ul>
+<p>这才是持续优化机制。</p>
+<hr />
+<h1>九、知识图谱在这个案例里怎么落地</h1>
+<p>以“输液外渗”为例，最后应该形成这样的图谱结构。</p>
+<h2>知识点节点</h2>
+<pre><code class="language-JSON">{
+  &quot;node_id&quot;: &quot;KP_BN_IV_007&quot;,
+  &quot;node_type&quot;: &quot;knowledge_point&quot;,
+  &quot;name&quot;: &quot;输液外渗的识别与处理&quot;,
+  &quot;course&quot;: &quot;基础护理学&quot;,
+  &quot;chapter&quot;: &quot;静脉输液与输血&quot;,
+  &quot;section&quot;: &quot;静脉输液&quot;,
+  &quot;knowledge_type&quot;: &quot;异常处理类&quot;,
+  &quot;difficulty&quot;: &quot;中等&quot;,
+  &quot;importance&quot;: &quot;高频考点&quot;
+}
+</code></pre>
+<h2>术语节点</h2>
+<pre><code class="language-JSON">{
+  &quot;node_id&quot;: &quot;TERM_IV_EXTRAVASATION&quot;,
+  &quot;node_type&quot;: &quot;term&quot;,
+  &quot;standard_name&quot;: &quot;输液外渗&quot;,
+  &quot;aliases&quot;: [
+    &quot;液体外渗&quot;,
+    &quot;局部肿胀&quot;,
+    &quot;穿刺部位肿胀&quot;,
+    &quot;针眼鼓包&quot;,
+    &quot;输液部位疼痛&quot;
+  ]
+}
+</code></pre>
+<h2>能力点节点</h2>
+<pre><code class="language-JSON">{
+  &quot;node_id&quot;: &quot;COMP_ABNORMAL_RECOGNITION&quot;,
+  &quot;node_type&quot;: &quot;competency&quot;,
+  &quot;name&quot;: &quot;异常识别能力&quot;,
+  &quot;domain&quot;: &quot;护理操作能力&quot;
+}
+</code></pre>
+<h2>关系边</h2>
+<pre><code class="language-JSON">[
+  {
+    &quot;source&quot;: &quot;KP_BN_IV_007&quot;,
+    &quot;relation&quot;: &quot;属于&quot;,
+    &quot;target&quot;: &quot;静脉输液&quot;
+  },
+  {
+    &quot;source&quot;: &quot;TERM_IV_EXTRAVASATION&quot;,
+    &quot;relation&quot;: &quot;标准术语对应&quot;,
+    &quot;target&quot;: &quot;KP_BN_IV_007&quot;
+  },
+  {
+    &quot;source&quot;: &quot;KP_BN_IV_007&quot;,
+    &quot;relation&quot;: &quot;支撑能力&quot;,
+    &quot;target&quot;: &quot;COMP_ABNORMAL_RECOGNITION&quot;
+  },
+  {
+    &quot;source&quot;: &quot;KP_BN_IV_007&quot;,
+    &quot;relation&quot;: &quot;易混淆&quot;,
+    &quot;target&quot;: &quot;静脉炎的观察与护理&quot;
+  },
+  {
+    &quot;source&quot;: &quot;KP_BN_IV_007&quot;,
+    &quot;relation&quot;: &quot;应用于病例&quot;,
+    &quot;target&quot;: &quot;CASE_IV_001&quot;
+  },
+  {
+    &quot;source&quot;: &quot;KP_BN_IV_007&quot;,
+    &quot;relation&quot;: &quot;被题目考查&quot;,
+    &quot;target&quot;: &quot;QUESTION_IV_071&quot;
+  },
+  {
+    &quot;source&quot;: &quot;KP_BN_IV_007&quot;,
+    &quot;relation&quot;: &quot;由教材证据支撑&quot;,
+    &quot;target&quot;: &quot;BN_IV_CHUNK_007&quot;
+  }
+]
+</code></pre>
+<p>这才是“知识库、知识图谱、能力图谱、题库、病例”的融合。</p>
+<hr />
+<h1>十、真正的竞争力在哪里？</h1>
+<p>不是 embedding 提示词本身，而是以下 8 个资产。</p>
+<h2>1. 医学教材知识切分规则</h2>
+<p>别人按字数切。<br />
+我们按医学教育语义切。</p>
+<p>例如：</p>
+<ul>
+<li>概念；</li>
+<li>目的；</li>
+<li>适应证；</li>
+<li>禁忌证；</li>
+<li>操作步骤；</li>
+<li>注意事项；</li>
+<li>异常处理；</li>
+<li>护理评价；</li>
+<li>健康教育；</li>
+<li>考点；</li>
+<li>病例决策点。</li>
+</ul>
+<p>这是行业 Know-how。</p>
+<hr />
+<h2>2. 教材原文与增强文本双轨机制</h2>
+<p>原文用于证据引用。<br />
+增强文本用于高召回检索。</p>
+<p>这样既能准，又能追溯。</p>
+<hr />
+<h2>3. 医学术语标准化体系</h2>
+<p>把教材语言、学生语言、考试语言、临床语言统一起来。</p>
+<p>例如：</p>
+<blockquote>
+<p>针眼鼓包 → 局部肿胀 → 液体外渗 → 输液外渗</p>
+</blockquote>
+<p>这比单纯 embedding 更重要。</p>
+<hr />
+<h2>4. 图文表一体化处理能力</h2>
+<p>医学教材大量知识在图表里。</p>
+<p>必须做到：</p>
+<ul>
+<li>图片有说明；</li>
+<li>表格有结构；</li>
+<li>图表有关联正文；</li>
+<li>图表可以被检索；</li>
+<li>图表可以被引用；</li>
+<li>图表可以进入题库和病例。</li>
+</ul>
+<hr />
+<h2>5. 知识图谱骨架</h2>
+<p>先定义节点和关系，后续所有教材、题库、病例都按同一套结构进入。</p>
+<p>这会形成长期数据资产。</p>
+<hr />
+<h2>6. 题库与教材证据关联</h2>
+<p>每一道题都知道：</p>
+<ul>
+<li>考哪个知识点；</li>
+<li>对应教材哪一页；</li>
+<li>为什么选这个；</li>
+<li>错选项对应什么误区；</li>
+<li>学生错了以后该补哪个知识点。</li>
+</ul>
+<p>这就是智能辅导智能体的底层能力。</p>
+<hr />
+<h2>7. 病例与能力图谱关联</h2>
+<p>每个病例不只是一个故事，而是挂接：</p>
+<ul>
+<li>知识点；</li>
+<li>操作步骤；</li>
+<li>临床判断；</li>
+<li>护理措施；</li>
+<li>能力点；</li>
+<li>评分点。</li>
+</ul>
+<p>这会直接支撑 AISP、护理思维、OSCE、实训评价。</p>
+<hr />
+<h2>8. 自动评测体系</h2>
+<p>谁有评测集，谁就能持续优化。</p>
+<p>最终天堰要形成自己的：</p>
+<blockquote>
+<p><strong>医学教材 RAG 评测基准库</strong></p>
+</blockquote>
+<p>例如：</p>
+<ul>
+<li>基础护理学 1000 个标准问题；</li>
+<li>护士资格证 1000 道题目映射；</li>
+<li>护理操作 300 个流程问题；</li>
+<li>病例推理 300 个场景；</li>
+<li>图表理解 200 个问题。</li>
+</ul>
+<p>这是比模型更重要的壁垒。</p>
+<hr />
+<h1>十一、我建议您现在就按这个路径推进</h1>
+<h2>第一步：先选一个章节做样板</h2>
+<p>建议就选：</p>
+<blockquote>
+<p>《基础护理学》静脉输液章节</p>
+</blockquote>
+<p>因为它同时包含：</p>
+<ul>
+<li>概念；</li>
+<li>流程；</li>
+<li>操作；</li>
+<li>图片；</li>
+<li>表格；</li>
+<li>异常处理；</li>
+<li>题库；</li>
+<li>病例；</li>
+<li>OSCE；</li>
+<li>实训评价。</li>
+</ul>
+<p>非常适合做样板工程。</p>
+<hr />
+<h2>第二步：先设计输出 Schema</h2>
+<p>不要先写代码，不要先买模型。</p>
+<p>先定义每个 chunk 要输出什么字段：</p>
+<pre><code class="language-JSON">{
+  &quot;chunk_id&quot;: &quot;&quot;,
+  &quot;source_text&quot;: &quot;&quot;,
+  &quot;textbook&quot;: &quot;&quot;,
+  &quot;edition&quot;: &quot;&quot;,
+  &quot;chapter&quot;: &quot;&quot;,
+  &quot;section&quot;: &quot;&quot;,
+  &quot;page_no&quot;: &quot;&quot;,
+  &quot;knowledge_point_id&quot;: &quot;&quot;,
+  &quot;knowledge_point_name&quot;: &quot;&quot;,
+  &quot;knowledge_type&quot;: &quot;&quot;,
+  &quot;standard_terms&quot;: [],
+  &quot;aliases&quot;: [],
+  &quot;competencies&quot;: [],
+  &quot;related_images&quot;: [],
+  &quot;related_tables&quot;: [],
+  &quot;candidate_graph_relations&quot;: [],
+  &quot;embedding_text&quot;: &quot;&quot;,
+  &quot;evidence&quot;: {
+    &quot;page_image&quot;: &quot;&quot;,
+    &quot;bbox&quot;: []
+  },
+  &quot;confidence&quot;: 0.0,
+  &quot;quality_flags&quot;: []
+}
+</code></pre>
+<p>Schema 定好了，AI 才能规模化生产。</p>
+<hr />
+<h2>第三步：让 GPT-5.5 或 Opus 级模型做标杆样本</h2>
+<p>先处理 5–10 页，不要直接处理整本书。</p>
+<p>产出：</p>
+<ul>
+<li>20–50 个高质量知识点 chunk；</li>
+<li>术语标准化样本；</li>
+<li>图片说明样本；</li>
+<li>图谱关系样本；</li>
+<li>评测题样本。</li>
+</ul>
+<p>然后您亲自看一遍。</p>
+<p>这个样板就是后续全书加工的“生产标准”。</p>
+<hr />
+<h2>第四步：批量处理全书</h2>
+<p>用成本更低的强模型批量跑。</p>
+<p>然后用 GPT-5.5 做抽检和裁判。</p>
+<hr />
+<h2>第五步：把题库和病例接进来</h2>
+<p>不要一开始就接全部题库和病例。</p>
+<p>先选：</p>
+<ul>
+<li>50 道静脉输液相关题；</li>
+<li>5–10 个输液异常处理病例；</li>
+<li>1–2 个 OSCE 考站。</li>
+</ul>
+<p>做出闭环样板：</p>
+<blockquote>
+<p>教材知识点 → 题目 → 病例 → 实训 → 评价 → 学情分析</p>
+</blockquote>
+<p>这就是产品价值展示。</p>
+<hr />
+<h1>十二、最终建议</h1>
+<p>我的最终判断是：</p>
+<blockquote>
+<p><strong>第一期不要重资产建设完整知识图谱，但必须图谱化设计。</strong></p>
+</blockquote>
+<p>具体路线：</p>
+<ol>
+<li><strong>先设计图谱骨架和数据 Schema；</strong></li>
+<li><strong>用 AI 建设教材 RAG 知识库；</strong></li>
+<li><strong>每个 chunk 同步生成知识点、术语、能力点和候选关系；</strong></li>
+<li><strong>用评测集筛选和修正这些候选关系；</strong></li>
+<li><strong>再沉淀正式知识图谱、能力图谱、题库图谱、病例图谱；</strong></li>
+<li><strong>最终形成医学教育知识工程平台，而不是单纯知识库。</strong></li>
+</ol>
+<p>关于模型，我建议：</p>
+<blockquote>
+<p><strong>GPT-5.5 / Claude Opus 级模型用于标准制定、样板章节、疑难复核和最终评测；批量生产不要全部使用最贵模型。</strong></p>
+</blockquote>
+<p>真正的护城河不是“用了最强模型”，而是：</p>
+<blockquote>
+<p><strong>用最强模型帮助我们建立一套可复制、可评测、可追溯、可持续进化的医学教材知识工程流水线。</strong></p>
+</blockquote>
+</div>
+<script>
+    const previewElement = document.getElementById('preview')
+    Vditor.setContentTheme('light', 'https://unpkg.com/vditor@3.11.0/dist/css/content-theme');
+    Vditor.codeRender(previewElement);
+    Vditor.highlightRender({"enable":true,"lineNumber":false,"defaultLang":"","style":"github"}, previewElement, 'https://unpkg.com/vditor@3.11.0');
+    Vditor.mathRender(previewElement, {
+        cdn: 'https://unpkg.com/vditor@3.11.0',
+        math: {"engine":"KaTeX","inlineDigit":false,"macros":{}},
+    });
+    Vditor.mermaidRender(previewElement, 'https://unpkg.com/vditor@3.11.0', 'classic');
+    Vditor.SMILESRender(previewElement, 'https://unpkg.com/vditor@3.11.0', 'classic');
+    Vditor.markmapRender(previewElement, 'https://unpkg.com/vditor@3.11.0');
+    Vditor.flowchartRender(previewElement, 'https://unpkg.com/vditor@3.11.0');
+    Vditor.graphvizRender(previewElement, 'https://unpkg.com/vditor@3.11.0');
+    Vditor.chartRender(previewElement, 'https://unpkg.com/vditor@3.11.0', 'classic');
+    Vditor.mindmapRender(previewElement, 'https://unpkg.com/vditor@3.11.0', 'classic');
+    Vditor.abcRender(previewElement, 'https://unpkg.com/vditor@3.11.0');
+    Vditor.mediaRender(previewElement);
+    Vditor.speechRender(previewElement);
+</script>
+<script src="https://unpkg.com/vditor@3.11.0/dist/js/icons/ant.js"></script></body></html>
