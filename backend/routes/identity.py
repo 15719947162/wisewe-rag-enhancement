@@ -1,3 +1,15 @@
+"""
+身份认证与用户管理路由模块
+
+这个模块提供了完整的身份认证流程,包括:
+- 单点登录(SSO)启动和回调
+- 会话管理(登录、登出、刷新)
+- 身份快照同步
+- 权限验证
+
+支持与 AI Base 平台集成的单点登录功能。
+"""
+
 from __future__ import annotations
 
 from urllib.parse import urlsplit
@@ -38,19 +50,21 @@ router = APIRouter()
 
 
 class AiBaseExchangeRequest(BaseModel):
+    """AI Base 凭证交换请求"""
     model_config = ConfigDict(populate_by_name=True)
 
-    code: str | None = Field(default=None, min_length=1)
-    jwt: str | None = Field(default=None, min_length=1)
-    state: str | None = Field(default=None, min_length=1)
+    code: str | None = Field(default=None, min_length=1)  # 授权码
+    jwt: str | None = Field(default=None, min_length=1)   # JWT token
+    state: str | None = Field(default=None, min_length=1)  # 状态参数
 
 
 class AiBaseLogoutCallbackRequest(BaseModel):
+    """AI Base 登出回调请求"""
     model_config = ConfigDict(populate_by_name=True)
 
-    tenant_id: str = Field(..., alias="tenantId", min_length=1)
-    user_id: str | None = Field(default=None, alias="userId")
-    reason: str = Field(default="", max_length=200)
+    tenant_id: str = Field(..., alias="tenantId", min_length=1)  # 租户ID
+    user_id: str | None = Field(default=None, alias="userId")    # 用户ID
+    reason: str = Field(default="", max_length=200)              # 登出原因
 
 
 @router.get("/api/identity/snapshot-users")
@@ -58,6 +72,27 @@ def identity_snapshot_users(
     limit: int = 10,
     identity: IdentityContext = Depends(get_current_identity),
 ) -> dict:
+    """
+    获取身份快照用户列表
+
+    查询本地存储的用户身份快照数据,用于调试和管理。
+
+    参数:
+        limit: 返回数量限制,默认 10 条
+
+    返回值:
+        dict: 用户列表
+            - mode: 模式标识
+            - users: 用户快照列表
+            - count: 用户数量
+
+    使用场景:
+        - 调试身份同步问题
+        - 查看本地缓存的用户数据
+
+    权限要求:
+        - 超级管理员权限
+    """
     _assert_super_manager(identity, "view identity snapshot users")
     try:
         users = list_identity_snapshot_users(limit)
@@ -71,8 +106,29 @@ def identity_snapshot_users(
     }
 
 
+
 @router.get("/api/auth/ai-base/config")
 def ai_base_sso_config() -> dict:
+    """
+    获取 AI Base SSO 配置信息
+
+    返回单点登录的配置参数,包括客户端ID、回调地址等。
+    前端需要这些信息来构建登录跳转链接。
+
+    返回值:
+        dict: SSO 配置信息
+            - configured: 是否已配置
+            - mode: 认证模式
+            - baseUrl: AI Base 服务地址
+            - clientId: 客户端ID
+            - redirectUri: 回调地址
+            - 各种路径配置
+
+    使用场景:
+        - 前端初始化登录组件
+        - 判断是否启用 SSO
+        - 获取登录跳转参数
+    """
     config = load_sso_config()
     return {
         "configured": is_sso_configured(config),
@@ -99,6 +155,23 @@ def ai_base_sso_config() -> dict:
 
 @router.get("/api/auth/ai-base/launch")
 def ai_base_sso_launch(next: str = Query(default="/knowledge-bases")):
+    """
+    启动 AI Base SSO 登录流程
+
+    用户点击登录后,会跳转到这个接口。
+    系统生成状态参数,然后重定向到 AI Base 的登录页面。
+
+    参数:
+        next: 登录成功后的跳转目标路径,默认 "/knowledge-bases"
+
+    返回值:
+        RedirectResponse: 重定向到 AI Base 登录页
+
+    使用场景:
+        - 用户点击登录按钮
+        - 强制重新登录
+        - 切换账号
+    """
     try:
         config = load_sso_config()
         state, payload = make_state_payload(next, config=config)
@@ -125,6 +198,29 @@ async def ai_base_sso_callback(
     state: str | None = None,
     sso_state: str | None = Cookie(default=None, alias=STATE_COOKIE_NAME),
 ):
+    """
+    AI Base SSO 登录回调
+
+    用户在 AI Base 登录成功后,会跳转到这个回调接口。
+    系统验证状态参数,用授权码换取用户信息,创建本地会话。
+
+    参数:
+        code: AI Base 返回的授权码
+        state: 状态参数,用于防止 CSRF 攻击
+        sso_state: Cookie 中的状态参数
+
+    返回值:
+        RedirectResponse: 重定向到目标页面,并设置会话 Cookie
+
+    使用场景:
+        - SSO 登录流程的第二步
+        - 自动处理登录回调
+
+    错误情况:
+        - 状态验证失败
+        - 授权码无效
+        - 用户信息获取失败
+    """
     try:
         next_path = validate_state(sso_state, state)
         summary = await exchange_ai_base_credential(code=code)
@@ -142,6 +238,30 @@ async def ai_base_sso_callback(
 
 @router.post("/api/auth/ai-base/exchange")
 async def ai_base_sso_exchange(payload: AiBaseExchangeRequest, response: Response) -> dict:
+    """
+    AI Base 凭证交换接口(非浏览器方式)
+
+    对于非浏览器的客户端(如移动端),可以直接用授权码或 JWT 换取会话。
+    不会跳转页面,直接返回会话信息。
+
+    参数:
+        payload: 交换请求,包含授权码或 JWT
+
+    返回值:
+        dict: 会话信息
+            - identity: 用户身份信息
+            - expiresAt: 会话过期时间
+            - mode: 会话模式
+
+    使用场景:
+        - 移动端登录
+        - API 客户端登录
+        - 服务端到服务端的认证
+
+    错误情况:
+        - 凭证无效
+        - 凭证过期
+    """
     try:
         summary = await exchange_ai_base_credential(code=payload.code, jwt=payload.jwt)
         session = create_session_from_identity_summary(summary)
@@ -160,6 +280,25 @@ async def ai_base_sso_exchange(payload: AiBaseExchangeRequest, response: Respons
 
 @router.get("/api/auth/session")
 def auth_session(identity: IdentityContext = Depends(get_current_identity)) -> dict:
+    """
+    获取当前会话信息
+
+    查询当前登录用户的身份信息和会话状态。
+    前端可以用这个接口判断用户是否登录。
+
+    返回值:
+        dict: 会话信息
+            - identity: 用户身份信息(租户ID、用户ID、角色等)
+            - mode: 认证模式(会话来源)
+
+    使用场景:
+        - 前端检查登录状态
+        - 获取用户权限信息
+        - 显示用户信息
+
+    错误情况:
+        - 401: 未登录
+    """
     if not identity.enforce_access:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return {
@@ -170,6 +309,24 @@ def auth_session(identity: IdentityContext = Depends(get_current_identity)) -> d
 
 @router.post("/api/auth/ai-base/refresh-current-user")
 async def refresh_current_user(identity: IdentityContext = Depends(get_current_identity)) -> dict:
+    """
+    刷新当前用户的身份快照
+
+    从 AI Base 重新获取当前用户的最新身份信息并更新本地快照。
+    用于同步最新的权限和角色变更。
+
+    返回值:
+        dict: 更新后的用户信息
+
+    使用场景:
+        - 权限变更后刷新
+        - 角色调整后同步
+        - 强制更新用户信息
+
+    错误情况:
+        - 401: 未登录
+        - 获取用户信息失败
+    """
     if not identity.enforce_access:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -188,6 +345,29 @@ async def identity_sync_delta(
     last_sync_at: str | None = Query(default=None),
     identity: IdentityContext = Depends(get_current_identity),
 ) -> dict:
+    """
+    同步身份增量更新
+
+    从 AI Base 同步自上次同步后的身份变更(新增用户、权限变更等)。
+    用于保持本地身份数据与 AI Base 一致。
+
+    参数:
+        last_sync_at: 上次同步时间,可选
+
+    返回值:
+        dict: 同步结果
+            - 新增用户数量
+            - 更新用户数量
+            - 删除用户数量
+
+    使用场景:
+        - 定期同步身份数据
+        - 手动触发同步
+        - 批量用户管理
+
+    权限要求:
+        - SSO 认证的超级管理员
+    """
     if not identity.enforce_access:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not _can_run_identity_delta_sync(identity):
@@ -205,6 +385,23 @@ async def identity_sync_delta(
 
 @router.delete("/api/identity/snapshot-data")
 def remove_identity_snapshot_data(identity: IdentityContext = Depends(get_current_identity)) -> dict:
+    """
+    清除本地身份快照数据
+
+    删除本地存储的所有用户身份快照数据,通常用于重置或清理。
+
+    返回值:
+        dict: 删除结果
+            - deleted: 删除的记录统计
+
+    使用场景:
+        - 清理本地缓存
+        - 重置身份数据
+        - 调试问题
+
+    权限要求:
+        - 超级管理员权限
+    """
     _assert_super_manager(identity, "remove identity snapshot data")
     try:
         deleted = clear_identity_snapshot_data()
@@ -228,6 +425,24 @@ def remove_identity_snapshot_data(identity: IdentityContext = Depends(get_curren
 
 @router.get("/api/identity/sync-status")
 def identity_sync_status(identity: IdentityContext = Depends(get_current_identity)) -> dict:
+    """
+    获取身份同步状态
+
+    查询自动同步调度器的运行状态,包括上次同步时间、下次同步时间等。
+
+    返回值:
+        dict: 同步状态信息
+            - lastSyncAt: 上次同步时间
+            - nextSyncAt: 下次同步时间
+            - status: 同步器状态
+
+    使用场景:
+        - 监控同步任务
+        - 查看同步进度
+
+    权限要求:
+        - 超级管理员权限
+    """
     _assert_super_manager(identity, "view identity sync status")
     return get_identity_sync_status()
 
@@ -237,6 +452,21 @@ def auth_logout(
     response: Response,
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> dict:
+    """
+    用户登出
+
+    注销当前会话,清除登录状态。用户需要重新登录才能继续访问。
+
+    返回值:
+        dict: 登出结果
+            - ok: 操作成功
+            - revoked: 是否撤销了会话
+
+    使用场景:
+        - 用户主动登出
+        - 切换账号
+        - 安全退出
+    """
     revoked = revoke_auth_session(session_token or "")
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return {"ok": True, "revoked": revoked}
@@ -248,6 +478,31 @@ def ai_base_logout_callback(
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
     x_client_secret: str | None = Header(default=None, alias="X-Client-Secret"),
 ) -> dict:
+    """
+    AI Base 登出回调
+
+    当用户在 AI Base 登出时,会调用这个接口通知 RAG 系统也登出该用户。
+    撤销该用户在本系统的所有会话。
+
+    参数:
+        payload: 登出通知,包含租户ID、用户ID、原因
+        x_client_id: AI Base 客户端ID(用于验证调用方)
+        x_client_secret: AI Base 客户端密钥
+
+    返回值:
+        dict: 处理结果
+            - ok: 操作成功
+            - tenantId: 租户ID
+            - userId: 用户ID
+            - revoked: 撤销的会话数量
+
+    使用场景:
+        - AI Base 统一登出
+        - 多系统同步登出
+
+    权限验证:
+        - 需要验证 AI Base 客户端凭证
+    """
     _assert_ai_base_server_credentials(x_client_id, x_client_secret)
     revoked = revoke_auth_sessions_for_identity(payload.tenant_id, payload.user_id)
     append_audit_log(

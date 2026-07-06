@@ -1,3 +1,27 @@
+"""
+阿里云 Document Mind PDF 解析器
+
+这个模块实现了阿里云 Document Mind OpenAPI 的 PDF 解析功能。
+Document Mind 是阿里云提供的智能文档解析服务,可以提取 PDF 中的文本、表格、图片等内容。
+
+主要功能:
+1. 单任务解析 - 将整个 PDF 作为单个任务提交给 Document Mind
+2. 分片解析 - 将大 PDF 切分成多个小片段并行解析,提高处理速度
+3. Hedged 解析 - 在等待超时后自动发起额外请求,降低延迟抖动影响
+4. 多密钥池管理 - 支持多个阿里云密钥轮换,避免单密钥限流
+
+关键概念:
+- ContentBlock: 解析输出的内容块(文本、表格、图片等)
+- PdfShard: PDF 分片,每个分片包含若干页
+- CredentialPool: 密钥池,管理多个阿里云密钥的轮换和限流处理
+
+环境变量配置:
+- ALIYUN_DOCUMENT_MIND_ACCESS_KEY_ID: 主密钥 ID
+- ALIYUN_DOCUMENT_MIND_ACCESS_KEY_SECRET: 主密钥 Secret
+- ALIYUN_DOCUMENT_MIND_CREDENTIAL_POOL: 额外密钥池(JSON 格式)
+- ALIYUN_DOCUMENT_MIND_SHARDING_ENABLED: 是否启用分片解析
+- ALIYUN_DOCUMENT_MIND_HEDGED_SHARD_ENABLED: 是否启用 hedged 解析
+"""
 from __future__ import annotations
 
 import hashlib
@@ -70,11 +94,32 @@ _DOCUMENT_MIND_KEY_HISTORY_LOCK = threading.Lock()
 
 
 class DocumentMindEmptyResultError(ValueError):
-    """Raised when Document Mind reports success but returns no parseable content."""
+    """
+    Document Mind 返回空结果异常
+
+    当 Document Mind API 返回成功状态,但实际内容为空时抛出此异常。
+    这通常发生在:
+    1. PDF 文件损坏或格式异常
+    2. PDF 是纯图片扫描文档但未启用 OCR
+    3. API 内部处理错误导致结果丢失
+
+    处理方式: 会自动重试几次,如果仍然为空则抛出此异常。
+    """
 
 
 @dataclass(frozen=True)
 class _DocumentMindCredential:
+    """
+    Document Mind 密钥凭证
+
+    存储阿里云密钥的访问信息,包含:
+    - access_key_id: 阿里云 AccessKey ID
+    - access_key_secret: 阿里云 AccessKey Secret
+    - alias: 密钥别名(用于日志和监控)
+    - fingerprint: 密钥指纹(用于历史记录追踪)
+
+    frozen=True 表示这是一个不可变对象,创建后不能修改。
+    """
     access_key_id: str
     access_key_secret: str
     alias: str
@@ -83,6 +128,17 @@ class _DocumentMindCredential:
 
 @dataclass(frozen=True)
 class _DocumentMindCredentialLease:
+    """
+    密钥租约
+
+    从密钥池获取密钥后返回的租约对象。
+    相当于"借用"一个密钥一段时间,使用完成后需要归还。
+
+    这样设计是为了:
+    1. 控制并发 - 每个密钥同时最多处理 N 个任务
+    2. 防限流 - 如果某个密钥被限流,可以切换到其他密钥
+    3. 健康监控 - 记录每个密钥的成功/失败次数和平均延迟
+    """
     credential: _DocumentMindCredential
 
     @property
@@ -92,6 +148,18 @@ class _DocumentMindCredentialLease:
 
 @dataclass
 class _DocumentMindShardState:
+    """
+    分片解析状态
+
+    在分片解析过程中,跟踪每个 PDF 分片的解析状态:
+    - shard: 对应的 PdfShard 对象
+    - primary_started_at: 主任务开始时间
+    - hedge_count: 已经发起的 hedged 任务数量
+    - aliases: 已使用过的密钥别名集合
+    - errors: 遇到的错误列表
+
+    用于 hedged 解析策略,可以在主任务超时后发起额外请求。
+    """
     shard: PdfShard
     primary_started_at: float = 0.0
     hedge_count: int = 0
@@ -101,12 +169,43 @@ class _DocumentMindShardState:
 
 
 class _DocumentMindParseTimings:
+    """
+    解析性能计时器
+
+    收集解析过程中各个环节的时间消耗,用于性能监控和优化。
+
+    记录的内容包括:
+    - clientCreateMs: 创建 API 客户端的时间
+    - submitWallMs: 提交任务的时间
+    - pollWallMs: 轮询任务状态的时间
+    - convertMs: 转换结果的时间
+    - shardWallMs: 分片解析的总时间
+
+    使用线程锁保证并发环境下的数据安全。
+    """
+
     def __init__(self) -> None:
         self._values: Counter[str] = Counter()
         self._max_values: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def observe_ms(self, key: str, start: float, *, max_key: str | None = None) -> int:
+        """
+        观察并记录时间间隔
+
+        参数:
+            key: 记录键名(如 'submitMs', 'pollMs')
+            start: 开始时间(time.monotonic() 的值)
+            max_key: 如果提供,同时记录最大值
+
+        返回:
+            实际消耗的毫秒数
+
+        示例:
+            start = time.monotonic()
+            do_something()
+            timings.observe_ms("processMs", start, max_key="processMsMax")
+        """
         elapsed_ms = int((time.monotonic() - start) * 1000)
         self.add_ms(key, elapsed_ms, max_key=max_key)
         return elapsed_ms
@@ -134,6 +233,29 @@ class _DocumentMindParseTimings:
 
 
 class _DocumentMindCredentialPool:
+    """
+    密钥池管理器
+
+    管理多个阿里云密钥,实现密钥轮换、限流处理和性能追踪。
+
+    核心功能:
+    1. 密钥轮换 - 在多个密钥之间切换,避免单密钥过载
+    2. 限流冷却 - 检测到限流后暂停使用该密钥一段时间
+    3. 延迟追踪 - 记录每个密钥的平均延迟,优先选择快速密钥
+    4. 并发控制 - 每个密钥最多同时处理 N 个任务
+
+    工作原理:
+    - acquire(): 获取一个可用的密钥租约
+    - release(): 归还密钥租约,并记录使用结果
+    - 如果某个密钥被限流,会进入冷却期,期间不会被选中
+
+    参数:
+        credentials: 密钥列表
+        max_inflight_per_key: 每个密钥最大并发任务数
+        cooldown_seconds: 限流后冷却时间(秒)
+        unknown_probe_concurrency: 未测试密钥的探测并发数
+    """
+
     def __init__(
         self,
         credentials: list[_DocumentMindCredential],
@@ -371,6 +493,17 @@ class _DocumentMindCredentialPool:
 
 
 def get_last_document_mind_key_pool_metrics() -> dict[str, int]:
+    """
+    获取最近一次解析的密钥池指标
+
+    返回上次 parse_pdf 调用后收集的性能指标,包括:
+    - parseKeyPoolSize: 密钥池大小
+    - parseKeyThrottleCount: 限流次数
+    - parseKeyRetryCount: 重试次数
+    - 各密钥的成功/失败次数、平均延迟等
+
+    用于监控和诊断解析性能。
+    """
     with _LAST_KEY_POOL_METRICS_LOCK:
         return dict(_LAST_KEY_POOL_METRICS)
 
@@ -557,7 +690,36 @@ def parse_pdf(
     log_fn: Optional[Callable[[str], None]] = None,
     original_name: Optional[str] = None,
 ) -> list[ContentBlock]:
-    """Parse a PDF through Alibaba Document Mind OpenAPI."""
+    """
+    使用阿里云 Document Mind 解析 PDF 文件
+
+    这是主要的解析入口函数,会自动判断是否需要分片解析。
+
+    工作流程:
+    1. 检查 PDF 文件大小和页数
+    2. 如果超过阈值,启用分片解析(将 PDF 切成多个片段并行处理)
+    3. 否则使用单任务解析(整个 PDF 作为单个任务提交)
+    4. 返回解析出的 ContentBlock 列表
+
+    参数:
+        pdf_path: PDF 文件路径
+        output_dir: 输出目录(存放解析结果和图片)
+        log_fn: 日志回调函数,用于输出进度信息
+        original_name: 原始文件名(用于元数据)
+
+    返回:
+        ContentBlock 列表,包含文本、表格、图片等内容块
+
+    环境变量:
+        ALIYUN_DOCUMENT_MIND_SHARDING_ENABLED: 是否启用分片
+        ALIYUN_DOCUMENT_MIND_SHARDING_MIN_FILE_MB: 分片最小文件大小(MB)
+        ALIYUN_DOCUMENT_MIND_SHARDING_MIN_PAGES: 分片最小页数
+
+    示例:
+        blocks = parse_pdf("document.pdf", log_fn=print)
+        for block in blocks:
+            print(f"类型: {block.type}, 内容: {block.text[:50]}")
+    """
 
     def _log(message: str) -> None:
         if log_fn:
@@ -885,6 +1047,38 @@ def parse_pdf_sharded(
     credential_pool: _DocumentMindCredentialPool | None = None,
     timings: _DocumentMindParseTimings | None = None,
 ) -> list[ContentBlock]:
+    """
+    分片解析 PDF
+
+    将大 PDF 文件切分成多个小片段,并行提交给 Document Mind 解析。
+
+    为什么需要分片?
+    1. Document Mind 对单任务有时间限制,大文件可能超时
+    2. 并行处理可以显著提高解析速度
+    3. 如果某个片段失败,只需重试该片段,不影响整体
+
+    工作流程:
+    1. 检查 PDF 基本信息(页数、文件大小)
+    2. 计算合适的分片策略(每片多少页)
+    3. 切分 PDF 为多个片段文件
+    4. 并行提交所有片段到 Document Mind
+    5. 等待所有片段完成
+    6. 合并所有片段的解析结果
+    7. 调整全局页码(每个片段的页码需要偏移到原始 PDF 的对应位置)
+
+    参数:
+        pdf_path: PDF 文件路径
+        output_dir: 输出目录
+        log_fn: 日志回调函数
+        original_name: 原始文件名
+        inspection: PDF 检查信息(可选,避免重复检查)
+        sharding_config: 分片配置(可选)
+        credential_pool: 密钥池(可选)
+        timings: 性能计时器(可选)
+
+    返回:
+        合并后的 ContentBlock 列表,页码已调整为原始 PDF 的全局页码
+    """
     pool = credential_pool or _resolve_document_mind_credential_pool()
     sharding_cfg = sharding_config or _get_document_mind_sharding_config()
     timings = timings or _DocumentMindParseTimings()
@@ -1344,6 +1538,34 @@ def convert_document_mind_result(
     source_file: str,
     output_path: Path | str = Path("data/output"),
 ) -> list[ContentBlock]:
+    """
+    转换 Document Mind API 返回结果为 ContentBlock 列表
+
+    Document Mind API 返回的原始数据格式比较复杂,这个函数将其
+    转换为统一的 ContentBlock 格式,方便后续处理。
+
+    处理的内容类型:
+    1. Markdown 文本 - 提取标题、段落、表格等
+    2. VisualLayoutInfo - 提取图片、表格等结构化信息
+    3. 混合数据 - 合并多种来源的内容
+
+    转换规则:
+    - 标题(# 开头) -> BlockType.TITLE
+    - 表格(|...| 格式) -> BlockType.TABLE
+    - 图片链接 -> BlockType.IMAGE
+    - 普通文本 -> BlockType.TEXT
+
+    参数:
+        payload: Document Mind API 返回的数据(dict 或 markdown 字符串)
+        source_file: 源文件名(用于元数据)
+        output_path: 输出路径(用于解析图片路径)
+
+    返回:
+        ContentBlock 列表
+
+    异常:
+        DocumentMindEmptyResultError: 如果结果为空
+    """
     output = Path(output_path)
     if isinstance(payload, str):
         blocks = _markdown_to_blocks(payload, source_file, output_path)

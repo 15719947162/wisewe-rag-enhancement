@@ -1,3 +1,15 @@
+"""
+OpenAPI v1 接口路由模块
+
+这个模块提供了标准化的 OpenAPI 接口,用于外部系统集成。
+主要功能包括:
+- 知识库管理(查询知识库列表)
+- 文档导入(上传 PDF 并处理)
+- RAG 查询(向量检索和图谱检索)
+
+所有 OpenAPI 接口都需要 API Key 认证,支持签名验证机制。
+"""
+
 from __future__ import annotations
 
 import uuid
@@ -20,11 +32,17 @@ from core.prompts import LAYOUT_KEY_MAP, SUBJECT_KEY_MAP
 
 
 router = APIRouter()
+
+# 文件上传大小限制:500MB
 MAX_OPENAPI_UPLOAD_SIZE = 500 * 1024 * 1024
+
+# 文档主题类型选项(用于前端下拉框)
 SUBJECT_OPTIONS = [
     {"value": key, "label": label}
     for key, label in SUBJECT_KEY_MAP.items()
 ]
+
+# 文档布局类型选项(用于前端下拉框)
 LAYOUT_OPTIONS = [
     {"value": key, "label": label}
     for key, label in LAYOUT_KEY_MAP.items()
@@ -32,32 +50,35 @@ LAYOUT_OPTIONS = [
 
 
 class OpenApiQueryRequest(BaseModel):
+    """OpenAPI 向量检索请求参数"""
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(..., min_length=1, max_length=4000)
-    kb_id: str | None = Field(default=None, max_length=255)
-    top_k: int = Field(default=8, ge=1, le=20)
-    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
-    use_llm_check: bool = False
-    use_llm_score: bool = False
+    query: str = Field(..., min_length=1, max_length=4000)     # 查询文本
+    kb_id: str | None = Field(default=None, max_length=255)    # 知识库ID
+    top_k: int = Field(default=8, ge=1, le=20)                # 返回数量
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)    # 最小相似度
+    use_llm_check: bool = False                                # 是否用 LLM 过滤
+    use_llm_score: bool = False                                # 是否用 LLM 评分
 
 
 class OpenApiGraphQueryRequest(BaseModel):
+    """OpenAPI 图谱检索请求参数"""
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(..., min_length=1, max_length=4000)
-    kb_id: str | None = Field(default=None, max_length=255)
-    top_k: int = Field(default=5, ge=1, le=20)
-    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
-    explain: bool = False
-    intent: str | None = Field(default=None, max_length=100)
+    query: str = Field(..., min_length=1, max_length=4000)     # 查询文本
+    kb_id: str | None = Field(default=None, max_length=255)    # 知识库ID
+    top_k: int = Field(default=5, ge=1, le=20)                # 返回数量
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)    # 最小相似度
+    explain: bool = False                                       # 是否返回解释
+    intent: str | None = Field(default=None, max_length=100)   # 用户意图
 
 
 class PromptAppendRequest(BaseModel):
+    """提示词追加请求(用于自定义清洗/质检提示词)"""
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = Field(default="append", pattern="^append$")
-    content: str = Field(..., min_length=1, max_length=2000)
+    mode: str = Field(default="append", pattern="^append$")    # 模式:只支持追加
+    content: str = Field(..., min_length=1, max_length=2000)   # 提示词内容
 
 
 @router.get("/openapi/v1/knowledge-bases")
@@ -76,6 +97,41 @@ async def openapi_knowledge_bases(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
+    """
+    查询知识库列表
+
+    根据 API Key 的权限范围,返回可访问的知识库列表。
+    支持按范围、用户、角色过滤。
+
+    参数:
+        scope: 查询范围
+            - mine: 我的知识库
+            - tenant: 租户的所有知识库
+            - all: 所有知识库(需要特殊权限)
+        user_id: 按用户ID过滤
+        role_code: 按角色代码过滤
+        page: 页码,从 1 开始
+        page_size: 每页数量
+
+    认证方式:
+        - Authorization: Bearer <api_key>
+        - 或 X-API-Key: <api_key>
+        - 可选签名验证(通过 X-KB-* 头)
+
+    返回值:
+        JSONResponse: 知识库列表
+            - requestId: 请求ID
+            - data: 包含知识库数组分页数据
+
+    使用场景:
+        - 外部系统查询知识库
+        - 集成到第三方应用
+        - 自动化脚本查询
+
+    错误情况:
+        - 401: API Key 无效
+        - 403: 权限不足
+    """
     request_id = _request_id()
     guard = _guard_openapi_capability(
         request_id,
@@ -120,6 +176,7 @@ async def openapi_knowledge_bases(
     return JSONResponse({"requestId": request_id, "data": data})
 
 
+
 @router.get("/openapi/v1/ingestion/options")
 async def openapi_ingestion_options(
     request: Request,
@@ -132,6 +189,28 @@ async def openapi_ingestion_options(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
+    """
+    获取文档导入选项配置
+
+    返回所有可用的导入选项,包括切片策略、文档主题类型、文档布局类型、
+    PDF 解析器等。前端可以根据这些选项构建配置界面。
+
+    参数:
+        include_unavailable: 是否包含不可用的选项,默认 True
+
+    返回值:
+        JSONResponse: 可配置选项列表
+            - chunkStrategies: 切片策略列表
+            - subjectTypes: 文档主题类型列表
+            - layoutTypes: 文档布局类型列表
+            - parserProviders: PDF 解析器列表(包含可用性标识)
+            - notes: 重要说明
+
+    使用场景:
+        - 前端获取配置选项
+        - 集成系统查询支持的参数
+        - 检查解析器可用性
+    """
     request_id = _request_id()
     guard = _guard_openapi_capability(
         request_id,
@@ -177,6 +256,7 @@ async def openapi_ingestion_options(
     return JSONResponse({"requestId": request_id, "data": data})
 
 
+
 @router.get("/openapi/v1/ingestion/tasks/{task_id}")
 async def openapi_ingestion_task(
     task_id: str,
@@ -189,6 +269,27 @@ async def openapi_ingestion_task(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
+    """
+    查询导入任务详情
+
+    通过任务 ID 查询导入任务的详细状态和信息。
+
+    参数:
+        task_id: 任务 ID
+
+    返回值:
+        JSONResponse: 任务详情
+            - requestId: 请求ID
+            - data: 任务信息(状态、文件名、策略等)
+
+    使用场景:
+        - 外部系统查询导入进度
+        - 自动化脚本监控任务状态
+        - 回调通知时查询结果
+
+    错误情况:
+        - 404: 任务不存在
+    """
     request_id = _request_id()
     task = get_task(task_id)
     if not task:
@@ -215,6 +316,7 @@ async def openapi_ingestion_task(
     return JSONResponse({"requestId": request_id, "data": _task_to_payload(task)})
 
 
+
 @router.post("/openapi/v1/ingestion/upload", status_code=202)
 async def openapi_ingestion_upload(
     request: Request,
@@ -238,6 +340,44 @@ async def openapi_ingestion_upload(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
+    """
+    通过 OpenAPI 上传 PDF 文档
+
+    这是外部系统集成的主要入口,用于上传 PDF 并启动处理流程。
+    支持自定义切片策略、清洗提示词、质检提示词等参数。
+
+    参数:
+        file: 上传的 PDF 文件
+        kb_id: 目标知识库 ID(必填)
+        chunk_strategy: 切片策略,默认 "hierarchical"
+        subject_type: 文档主题类型,默认 "general"
+        layout_type: 文档布局类型,默认 "single_column"
+        parser_provider: PDF 解析器(可选)
+        auto_confirm: 是否自动确认,默认 False
+        cleaning_prompt_mode: 清洗提示词模式(只支持 "append")
+        cleaning_prompt_content: 清洗提示词内容
+        quality_prompt_mode: 质检提示词模式(只支持 "append")
+        quality_prompt_content: 质检提示词内容
+
+    认证方式:
+        - 必须使用 API Key 认证
+        - 强制要求签名验证(通过 X-KB-* 头)
+
+    返回值:
+        JSONResponse: 任务信息
+            - requestId: 请求ID
+            - data: 包含 taskId、状态等
+
+    使用场景:
+        - 外部系统自动化导入
+        - 批量文档处理
+        - 集成到业务流程
+
+    错误情况:
+        - 401: API Key 无效或签名验证失败
+        - 403: 权限不足
+        - 422: 文件格式错误或文件过大
+    """
     request_id = _request_id()
     content = await file.read()
     guard = _guard_openapi_call(
@@ -319,6 +459,7 @@ async def openapi_ingestion_upload(
     return JSONResponse({"requestId": request_id, "data": data}, status_code=202)
 
 
+
 @router.post("/openapi/v1/rag/query")
 async def openapi_rag_query(
     request: Request,
@@ -331,6 +472,36 @@ async def openapi_rag_query(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
+    """
+    OpenAPI 向量检索接口
+
+    在指定知识库中进行向量相似度检索,返回与查询文本最相关的文档片段。
+    这是 RAG 系统的核心查询接口。
+
+    请求体参数:
+        query: 查询文本(必填,最长 4000 字符)
+        kb_id: 知识库 ID
+        top_k: 返回数量,默认 8,最大 20
+        min_score: 最小相似度,默认 0.3
+        use_llm_check: 是否用 LLM 过滤结果
+        use_llm_score: 是否用 LLM 重新评分
+
+    返回值:
+        JSONResponse: 检索结果
+            - requestId: 请求ID
+            - data: 包含匹配的文档片段列表
+
+    使用场景:
+        - 外部系统集成 RAG 能力
+        - 构建智能问答机器人
+        - 文档搜索功能
+
+    错误情况:
+        - 401: API Key 无效
+        - 403: 权限不足
+        - 404: 知识库不存在
+        - 503: 查询失败
+    """
     request_id = _request_id()
     body = await request.body()
     try:
@@ -379,6 +550,7 @@ async def openapi_rag_query(
     return JSONResponse({"requestId": request_id, "data": result})
 
 
+
 @router.post("/openapi/v1/rag/graph-query")
 async def openapi_graph_rag_query(
     request: Request,
@@ -391,6 +563,36 @@ async def openapi_graph_rag_query(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
+    """
+    OpenAPI 图谱检索接口
+
+    结合知识图谱进行检索,不仅返回相似文档片段,还提供实体关系和推理路径。
+    相比向量检索,图谱检索能提供更结构化、更可解释的结果。
+
+    请求体参数:
+        query: 查询文本(必填,最长 4000 字符)
+        kb_id: 知识库 ID
+        top_k: 返回数量,默认 5,最大 20
+        min_score: 最小相似度,默认 0.3
+        explain: 是否返回推理路径解释
+        intent: 用户意图(可选)
+
+    返回值:
+        JSONResponse: 图谱检索结果
+            - requestId: 请求ID
+            - data: 包含匹配片段、实体关系、推理路径
+
+    使用场景:
+        - 需要理解实体关系的查询
+        - 需要可解释性的检索结果
+        - 复杂知识推理场景
+
+    错误情况:
+        - 401: API Key 无效
+        - 403: 权限不足
+        - 404: 知识库不存在
+        - 503: 查询失败
+    """
     request_id = _request_id()
     body = await request.body()
     try:

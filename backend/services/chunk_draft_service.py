@@ -1,3 +1,21 @@
+"""
+切片草稿服务模块
+
+本模块负责管理文档入库过程中的切片草稿数据，支持：
+1. 保存切片草稿（供用户预览和编辑）
+2. 加载切片草稿列表
+3. 更新、删除、合并切片草稿
+4. 加载可确认的切片数据（用于最终入库）
+
+为什么需要切片草稿？
+- 用户在确认入库前需要预览切片效果
+- 用户可以手动编辑切片内容
+- 用户可以删除不需要的切片
+- 用户可以合并相邻的切片
+
+数据存储在 PostgreSQL 的 chunk_drafts 表中，有过期时间（expires_at）自动清理。
+"""
+
 from __future__ import annotations
 
 import json
@@ -12,14 +30,24 @@ from core.models.triple import Triple
 
 
 def _serialize_related_ids(value: list[str] | None) -> str:
+    """将关联 ID 列表序列化为 JSON 字符串"""
     return json.dumps(value or [], ensure_ascii=False)
 
 
 def _serialize_models(items: list[Any]) -> str:
+    """将模型对象列表序列化为 JSON 字符串"""
     return json.dumps([item.model_dump() for item in items], ensure_ascii=False)
 
 
 def cleanup_expired_chunk_drafts() -> int:
+    """
+    清理过期的切片草稿
+
+    删除 expires_at 小于当前时间的草稿记录。
+
+    返回：
+        int: 删除的记录数量
+    """
     conn = get_db_connection()
     try:
         ensure_db_schema(conn)
@@ -33,6 +61,24 @@ def cleanup_expired_chunk_drafts() -> int:
 
 
 def save_chunk_drafts(task_id: str, kb_id: str, chunks: list[Chunk]) -> int:
+    """
+    保存切片草稿到数据库
+
+    在切片完成后，将切片数据保存到草稿表，供用户预览和编辑。
+
+    参数：
+        task_id: 任务 ID
+        kb_id: 知识库 ID
+        chunks: 切片列表
+
+    返回：
+        int: 保存的切片数量
+
+    说明：
+        - 先清理过期草稿
+        - 删除同一 task_id 的旧草稿
+        - 批量插入新草稿记录
+    """
     try:
         cleanup_expired_chunk_drafts()
     except Exception:
@@ -87,6 +133,15 @@ def save_chunk_drafts(task_id: str, kb_id: str, chunks: list[Chunk]) -> int:
 
 
 def _row_to_payload(row: tuple[Any, ...]) -> dict[str, Any]:
+    """
+    将数据库行转换为 API 响应格式的字典
+
+    参数：
+        row: 数据库查询结果行
+
+    返回：
+        dict: API 响应格式的切片草稿数据
+    """
     return {
         "id": str(row[0]),
         "taskId": row[1],
@@ -116,6 +171,19 @@ def _row_to_payload(row: tuple[Any, ...]) -> dict[str, Any]:
 
 
 def list_chunk_drafts(task_id: str) -> list[dict[str, Any]]:
+    """
+    获取指定任务的切片草稿列表
+
+    参数：
+        task_id: 任务 ID
+
+    返回：
+        list[dict]: 切片草稿列表，按 chunk_index 排序
+
+    说明：
+        - 会自动清理过期草稿
+        - 返回所有字段，包括用户编辑状态和删除标记
+    """
     try:
         cleanup_expired_chunk_drafts()
     except Exception:
@@ -143,6 +211,22 @@ def list_chunk_drafts(task_id: str) -> list[dict[str, Any]]:
 
 
 def update_chunk_draft(draft_id: str, content: str) -> dict[str, Any] | None:
+    """
+    更新切片草稿内容
+
+    用户手动编辑切片内容后调用此接口。
+
+    参数：
+        draft_id: 草稿 ID
+        content: 新的切片内容
+
+    返回：
+        dict | None: 更新后的草稿数据，如果草稿不存在则返回 None
+
+    说明：
+        - 更新 content 字段
+        - 设置 user_edited = True 标记用户编辑过
+    """
     conn = get_db_connection()
     try:
         ensure_db_schema(conn)
@@ -168,6 +252,21 @@ def update_chunk_draft(draft_id: str, content: str) -> dict[str, Any] | None:
 
 
 def delete_chunk_draft(draft_id: str) -> bool:
+    """
+    删除切片草稿（软删除）
+
+    用户标记不需要的切片后调用此接口。
+
+    参数：
+        draft_id: 草稿 ID
+
+    返回：
+        bool: 是否删除成功
+
+    说明：
+        - 不是物理删除，而是设置 is_deleted = True
+        - 同时设置 user_edited = True
+    """
     conn = get_db_connection()
     try:
         ensure_db_schema(conn)
@@ -188,6 +287,24 @@ def delete_chunk_draft(draft_id: str) -> bool:
 
 
 def merge_chunk_drafts(task_id: str, draft_ids: list[str]) -> dict[str, Any] | None:
+    """
+    合并多个切片草稿
+
+    用户选择相邻切片合并后调用此接口。
+
+    参数：
+        task_id: 任务 ID
+        draft_ids: 要合并的草稿 ID 列表
+
+    返回：
+        dict | None: 合并后的草稿数据，如果无法合并则返回 None
+
+    合并逻辑：
+        1. 按 chunk_index 排序
+        2. 将内容用 \\n\\n 连接
+        3. 合并 related_ids
+        4. 保留第一个草稿，删除其他草稿
+    """
     if len(draft_ids) < 2:
         return None
 
@@ -255,6 +372,23 @@ def merge_chunk_drafts(task_id: str, draft_ids: list[str]) -> dict[str, Any] | N
 
 
 def load_confirmable_chunks(task_id: str) -> list[Chunk]:
+    """
+    加载可确认入库的切片列表
+
+    用户确认入库时，从草稿表中加载未被删除的切片。
+
+    参数：
+        task_id: 任务 ID
+
+    返回：
+        list[Chunk]: Chunk 对象列表，可直接用于后续处理
+
+    说明：
+        - 会自动清理过期草稿
+        - 只加载 is_deleted = FALSE 的记录
+        - 按 chunk_index 排序
+        - 反序列化 extracted_entities、extracted_triples、relations 字段
+    """
     cleanup_expired_chunk_drafts()
     conn = get_db_connection()
     try:
@@ -299,6 +433,17 @@ def load_confirmable_chunks(task_id: str) -> list[Chunk]:
 
 
 def clear_chunk_drafts(task_id: str) -> int:
+    """
+    清除指定任务的所有切片草稿
+
+    任务完成或取消后调用，清理草稿数据。
+
+    参数：
+        task_id: 任务 ID
+
+    返回：
+        int: 删除的记录数量
+    """
     conn = get_db_connection()
     try:
         ensure_db_schema(conn)

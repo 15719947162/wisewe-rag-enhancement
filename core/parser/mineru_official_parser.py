@@ -1,3 +1,24 @@
+"""
+MinerU 官方 Precision API 解析器
+
+这个模块实现了 MinerU 官方 API (mineru.net) 的 PDF 解析功能。
+MinerU 是一个开源的 PDF 解析工具,官方提供的 Precision API 可以高质量提取 PDF 内容。
+
+主要功能:
+1. 单任务解析 - 将整个 PDF 上传到 OSS,提交解析任务,轮询等待结果
+2. 分片解析 - 将大 PDF 切分成多个片段并行解析
+3. 结果提取 - 从返回的 ZIP 包中提取解析结果和图片
+
+与 302AI MinerU 的区别:
+- mineru_parser.py: 使用 302AI 托管的 MinerU 服务
+- mineru_official_parser.py: 使用 MinerU 官方 API (mineru.net)
+
+环境变量配置:
+- MINERU_OFFICIAL_API_TOKEN: API 访问令牌(必需)
+- MINERU_OFFICIAL_API_BASE: API 地址(默认 https://mineru.net)
+- MINERU_OFFICIAL_MODEL_VERSION: 模型版本(默认 vlm)
+- MINERU_OFFICIAL_SHARDING_ENABLED: 是否启用分片解析
+"""
 from __future__ import annotations
 
 import math
@@ -36,7 +57,35 @@ def parse_pdf(
     log_fn: Optional[Callable[[str], None]] = None,
     original_name: Optional[str] = None,
 ) -> list[ContentBlock]:
-    """Parse a PDF through MinerU official Precision API."""
+    """
+    使用 MinerU 官方 API 解析 PDF
+
+    这是主要的解析入口函数,会自动判断是否需要分片解析。
+
+    工作流程:
+    1. 检查 PDF 文件大小和页数
+    2. 如果超过阈值,启用分片解析
+    3. 否则使用单任务解析:
+       a. 上传 PDF 到阿里云 OSS 获取签名 URL
+       b. 向 MinerU API 提交解析任务
+       c. 轮询任务状态直到完成
+       d. 下载结果 ZIP 包
+       e. 提取并转换为 ContentBlock 列表
+
+    参数:
+        pdf_path: PDF 文件路径
+        output_dir: 输出目录(存放解析结果和图片)
+        log_fn: 日志回调函数,用于输出进度信息
+        original_name: 原始文件名(用于元数据)
+
+    返回:
+        ContentBlock 列表,包含文本、表格、图片等内容块
+
+    示例:
+        blocks = parse_pdf("document.pdf", log_fn=print)
+        for block in blocks:
+            print(f"类型: {block.type}, 页码: {block.page_idx}")
+    """
     if _is_sharding_enabled():
         try:
             inspection = inspect_pdf(pdf_path, text_sample_pages=_official_int("SHARDING_TEXT_SAMPLE_PAGES", 5))
@@ -72,6 +121,35 @@ def parse_pdf_sharded(
     *,
     inspection: PdfInspection | None = None,
 ) -> list[ContentBlock]:
+    """
+    分片解析 PDF
+
+    将大 PDF 文件切分成多个小片段,并行提交给 MinerU API 解析。
+
+    为什么要分片?
+    1. MinerU API 对单个任务有处理限制
+    2. 并行处理可以显著提高解析速度
+    3. 大文件单任务容易超时或失败
+
+    工作流程:
+    1. 检查 PDF 基本信息(页数、文件大小)
+    2. 计算合适的分片策略(每片多少页)
+    3. 切分 PDF 为多个片段文件
+    4. 并行提交所有片段到 MinerU API
+    5. 等待所有片段完成
+    6. 合并所有片段的解析结果
+    7. 调整全局页码
+
+    参数:
+        pdf_path: PDF 文件路径
+        output_dir: 输出目录
+        log_fn: 日志回调函数
+        original_name: 原始文件名
+        inspection: PDF 检查信息(可选)
+
+    返回:
+        合并后的 ContentBlock 列表
+    """
     source_name = original_name or Path(pdf_path).name
     inspection = inspection or inspect_pdf(pdf_path, text_sample_pages=_official_int("SHARDING_TEXT_SAMPLE_PAGES", 5))
     output_path = Path(output_dir)
@@ -126,6 +204,28 @@ def parse_pdf_from_url(
     log_fn: Optional[Callable[[str], None]] = None,
     original_name: Optional[str] = None,
 ) -> list[ContentBlock]:
+    """
+    从 URL 解析 PDF
+
+    当 PDF 已经上传到 OSS 并有可访问 URL 时,直接使用该 URL 解析。
+
+    步骤:
+    1. 向 MinerU API 提交解析任务,传入 PDF URL
+    2. 轮询任务状态,等待完成
+    3. 获取结果 ZIP 包的下载 URL
+    4. 下载 ZIP 包并提取内容
+    5. 转换为 ContentBlock 列表
+
+    参数:
+        pdf_url: PDF 文件的 OSS URL
+        pdf_path: 本地 PDF 路径(可选,用于获取原始文件名)
+        output_dir: 输出目录
+        log_fn: 日志回调函数
+        original_name: 原始文件名
+
+    返回:
+        ContentBlock 列表
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     source_name = original_name or (Path(pdf_path).name if pdf_path else "document.pdf")
@@ -147,6 +247,25 @@ def parse_pdf_from_url(
 
 
 def _submit_task(pdf_url: str, log_fn: Optional[Callable[[str], None]] = None) -> str:
+    """
+    向 MinerU API 提交解析任务
+
+    调用 MinerU API 的 /api/v4/extract/task 接口提交 PDF 解析任务。
+
+    参数:
+        pdf_url: PDF 文件的 URL
+        log_fn: 日志回调函数
+
+    返回:
+        task_id: 任务 ID,用于后续查询任务状态
+
+    环境变量配置:
+        MINERU_OFFICIAL_MODEL_VERSION: 模型版本(vlm/ocr 等)
+        MINERU_OFFICIAL_IS_OCR: 是否启用 OCR
+        MINERU_OFFICIAL_ENABLE_FORMULA: 是否识别公式
+        MINERU_OFFICIAL_ENABLE_TABLE: 是否识别表格
+        MINERU_OFFICIAL_LANGUAGE: 文档语言(ch/en 等)
+    """
     token = _official_token()
     api_base = _official_api_base()
     url = f"{api_base}/api/v4/extract/task"
@@ -164,6 +283,31 @@ def _submit_task(pdf_url: str, log_fn: Optional[Callable[[str], None]] = None) -
 
 
 def _poll_task(task_id: str, log_fn: Optional[Callable[[str], None]] = None) -> str:
+    """
+    轮询 MinerU 任务状态
+
+    定期查询任务状态,直到任务完成或超时。
+
+    任务状态:
+    - done: 任务完成,可以下载结果
+    - failed: 任务失败
+    - processing: 任务正在处理中
+
+    参数:
+        task_id: 任务 ID
+        log_fn: 日志回调函数
+
+    返回:
+        result_url: 结果 ZIP 包的下载 URL
+
+    环境变量配置:
+        MINERU_OFFICIAL_TIMEOUT: 最大等待时间(秒)
+        MINERU_OFFICIAL_POLL_INTERVAL: 轮询间隔(秒)
+
+    异常:
+        RuntimeError: 任务失败
+        TimeoutError: 任务超时
+    """
     token = _official_token()
     url = f"{_official_api_base()}/api/v4/extract/task/{task_id}"
     headers = _official_headers(token)

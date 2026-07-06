@@ -1,3 +1,25 @@
+"""
+控制台服务模块
+
+本模块负责前端控制台的各类数据查询和操作，主要包括：
+1. 系统配置查询与更新
+2. 系统告警状态
+3. 任务队列状态
+4. 统计指标
+5. 评估记录查询
+6. 查询日志和审计日志
+7. 入库任务列表和日志
+8. Token 使用统计
+9. API Key 管理
+10. OpenAPI App 管理
+
+服务层职责：
+- 聚合多个数据源的数据
+- 转换数据格式为前端展示格式
+- 处理敏感配置的脱敏
+- 记录审计日志
+"""
+
 from __future__ import annotations
 
 import os
@@ -38,6 +60,7 @@ MASKED_SETTING_PREFIX = "****"
 
 
 def _utc_now() -> str:
+    """获取当前 UTC 时间（ISO 格式）"""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -51,6 +74,23 @@ def _entry(
     sensitive: bool = False,
     has_value: bool | None = None,
 ) -> dict[str, object]:
+    """
+    构建配置项数据结构
+
+    将配置值转换为前端展示格式，包含元信息。
+
+    参数：
+        label: 配置项名称
+        value: 配置值
+        category: 分类
+        editable: 是否可编辑
+        source: 值来源（env/config/code/db）
+        sensitive: 是否敏感（需脱敏）
+        has_value: 是否有值
+
+    返回：
+        dict: 配置项数据
+    """
     string_value = stringify_runtime_value(value)
     effective_mode = _setting_effective_mode(label)
     return {
@@ -74,11 +114,33 @@ def _entry(
 
 
 def _is_sensitive_setting(key: str) -> bool:
+    """
+    检查配置项是否为敏感配置
+
+    包含 api_key、access_key、credential、secret、password、token 的配置视为敏感。
+
+    参数：
+        key: 配置项名称
+
+    返回：
+        bool: 是否敏感
+    """
     normalized = key.lower()
     return any(token in normalized for token in SENSITIVE_SETTING_TOKENS)
 
 
 def _mask_sensitive_value(value: object) -> str:
+    """
+    脱敏敏感配置值
+
+    只显示最后 4 位，前面用 **** 替换。
+
+    参数：
+        value: 原始值
+
+    返回：
+        str: 脱敏后的值
+    """
     string_value = stringify_runtime_value(value)
     if not string_value:
         return ""
@@ -88,10 +150,34 @@ def _mask_sensitive_value(value: object) -> str:
 
 
 def _looks_like_masked_sensitive_value(value: str) -> bool:
+    """
+    检查值是否已被脱敏
+
+    用于更新配置时跳过未修改的敏感值。
+
+    参数：
+        value: 值
+
+    返回：
+        bool: 是否已被脱敏
+    """
     return value.strip().startswith(MASKED_SETTING_PREFIX)
 
 
 def _setting_effective_mode(key: str) -> str:
+    """
+    判断配置项的有效模式
+
+    - ops: 运维配置，需要重启服务生效
+    - gray: 灰度配置，新请求生效
+    - hot: 热配置，立即生效
+
+    参数：
+        key: 配置项名称
+
+    返回：
+        str: 有效模式
+    """
     normalized = key.lower()
     if _is_sensitive_setting(key):
         return "ops"
@@ -107,6 +193,18 @@ def _setting_effective_mode(key: str) -> str:
 
 
 def _kb_override_supported(key: str, effective_mode: str) -> bool:
+    """
+    检查配置项是否支持知识库级别覆盖
+
+    只有 hot 和 gray 模式的配置才支持知识库覆盖。
+
+    参数：
+        key: 配置项名称
+        effective_mode: 有效模式
+
+    返回：
+        bool: 是否支持覆盖
+    """
     if effective_mode not in {"hot", "gray"}:
         return False
     normalized = key.lower()
@@ -114,6 +212,17 @@ def _kb_override_supported(key: str, effective_mode: str) -> bool:
 
 
 def sanitize_console_settings_update(payload: dict) -> dict[str, str]:
+    """
+    清理并验证配置更新请求
+
+    过滤掉不可编辑的配置和未修改的敏感值。
+
+    参数：
+        payload: 原始更新请求
+
+    返回：
+        dict[str, str]: 清理后的有效更新
+    """
     safe_payload: dict[str, str] = {}
     for key, value in payload.items():
         if key not in EDITABLE_SETTINGS_KEYS or not isinstance(value, str):
@@ -125,6 +234,33 @@ def sanitize_console_settings_update(payload: dict) -> dict[str, str]:
 
 
 def get_settings_payload() -> list[dict]:
+    """
+    获取系统配置列表
+
+    返回所有可配置项，按分组组织。
+
+    返回：
+        list[dict]: 配置分组列表，每个分组包含：
+            - id: 分组 ID
+            - title: 分组标题
+            - description: 分组描述
+            - values: 配置项列表
+
+    分组包括：
+        - models_common: 通用模型
+        - models_embedding: 向量模型
+        - models_cleaner: 清洗模型
+        - models_chunker: 切片模型
+        - models_quality: 质量审核模型
+        - models_enhance: 三层增强模型
+        - models_rag: 问答生成模型
+        - identity_sso: 身份与 SSO
+        - parser: 解析配置
+        - chunking: 切片参数
+        - vector_db: 向量数据库配置
+        - storage: 存储配置
+        - about: 关于
+    """
     config = load_config()
     runtime_entries = {}
     for key in EDITABLE_SETTINGS_KEYS:
@@ -403,6 +539,18 @@ def get_settings_payload() -> list[dict]:
 
 
 def update_console_settings(payload: dict[str, str], updated_by: str = "console") -> dict[str, object]:
+    """
+    更新系统配置
+
+    将配置更新保存到数据库覆盖层。
+
+    参数：
+        payload: 配置更新字典
+        updated_by: 更新来源
+
+    返回：
+        dict: 更新结果
+    """
     updated = save_runtime_overrides(payload, updated_by=updated_by)
     return {"updated": updated, "count": len(updated)}
 
@@ -413,6 +561,17 @@ def update_console_settings_with_audit(
     identity: IdentityContext | None = None,
     updated_by: str = "console",
 ) -> dict[str, object]:
+    """
+    更新系统配置并记录审计日志
+
+    参数：
+        payload: 配置更新字典
+        identity: 用户身份上下文
+        updated_by: 更新来源
+
+    返回：
+        dict: 更新结果
+    """
     result = update_console_settings(payload, updated_by=updated_by)
     updated = list(result.get("updated") or [])
     append_audit_log(
@@ -431,6 +590,25 @@ def update_console_settings_with_audit(
 
 
 def get_console_alerts() -> list[dict]:
+    """
+    获取系统告警列表
+
+    检查系统关键配置是否正常，返回告警信息。
+
+    返回：
+        list[dict]: 告警列表，每个告警包含：
+            - id: 告警 ID
+            - title: 标题
+            - description: 描述
+            - severity: 严重程度（failed/degraded）
+            - area: 影响区域
+
+    检查项：
+        - PostgreSQL 是否可用
+        - 302AI API Key 是否配置
+        - MinerU 官方 API Token 是否配置
+        - LLM API Key 是否配置
+    """
     alerts: list[dict] = []
 
     if not is_db_available():
@@ -481,6 +659,21 @@ def get_console_alerts() -> list[dict]:
 
 
 def get_console_queue() -> list[dict]:
+    """
+    获取任务队列状态
+
+    返回待处理和失败的任务列表。
+
+    返回：
+        list[dict]: 任务队列列表，每个任务包含：
+            - id: 任务 ID
+            - lane: 队列类型（pending/recent/failed）
+            - title: 任务标题
+            - subtitle: 副标题
+            - status: 状态
+            - linkedHref: 跳转链接
+            - updatedAt: 更新时间
+    """
     tasks = get_all_tasks()
     queue: list[dict] = []
 
@@ -511,6 +704,17 @@ def get_console_queue() -> list[dict]:
 
 
 def get_console_metrics(identity: IdentityContext | None = None) -> list[dict]:
+    """
+    获取控制台统计指标
+
+    返回知识库数量、文档数量、活跃任务数量。
+
+    参数：
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: 指标列表
+    """
     kb_count = len(get_knowledge_bases_payload(identity))
     doc_count = len(get_documents_payload(identity=identity))
     active_task_count = len(
@@ -524,6 +728,18 @@ def get_console_metrics(identity: IdentityContext | None = None) -> list[dict]:
 
 
 def get_console_evaluations(kb_id: str | None = None, identity: IdentityContext | None = None) -> list[dict]:
+    """
+    获取评估记录列表
+
+    查询 RAG 评估记录，支持按知识库筛选。
+
+    参数：
+        kb_id: 知识库 ID，不传则查询所有
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: 评估记录列表
+    """
     records = load_evaluations()
     if identity and identity.enforce_access:
         visible_kb_ids = {str(item["id"]) for item in get_knowledge_bases_payload(identity)}
@@ -546,6 +762,26 @@ def get_console_query_logs(
     limit: int = 50,
     identity: IdentityContext | None = None,
 ) -> list[dict]:
+    """
+    获取 RAG 查询日志
+
+    支持多种筛选条件查询查询日志。
+
+    参数：
+        tenant_id: 租户 ID
+        kb_id: 知识库 ID
+        request_id: 请求 ID
+        actor_id: 操作者 ID
+        api_key_id: API Key ID
+        pipeline_domain: 管道域
+        start_at: 开始时间
+        end_at: 结束时间
+        limit: 返回数量限制
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: 查询日志列表
+    """
     records = fetch_rag_query_logs(
         tenant_id=tenant_id,
         kb_id=kb_id,
@@ -575,6 +811,28 @@ def get_console_audit_logs(
     limit: int = 50,
     identity: IdentityContext | None = None,
 ) -> list[dict]:
+    """
+    获取审计日志
+
+    支持多种筛选条件查询审计日志。
+
+    参数：
+        tenant_id: 租户 ID
+        actor_id: 操作者 ID
+        action: 操作类型
+        resource_type: 资源类型
+        resource_id: 资源 ID
+        request_id: 请求 ID
+        kb_id: 知识库 ID
+        outcome: 结果（success/failure）
+        start_at: 开始时间
+        end_at: 结束时间
+        limit: 返回数量限制
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: 审计日志列表
+    """
     records = fetch_audit_logs(
         tenant_id=tenant_id,
         actor_id=actor_id,
