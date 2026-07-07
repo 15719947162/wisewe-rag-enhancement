@@ -6,25 +6,45 @@ OpenAPI v1 接口路由模块
 - 知识库管理(查询知识库列表)
 - 文档导入(上传 PDF 并处理)
 - RAG 查询(向量检索和图谱检索)
+- 网页抓取导入
+- 备份 CSV 导入
 
-所有 OpenAPI 接口都需要 API Key 认证,支持签名验证机制。
+所有 OpenAPI 接口都需要 API Key 认证,支持签名验证机制和并发控制。
 """
 
 from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.schemas.requests import GraphQueryRequest, QueryRequest
-from backend.services.identity_service import get_current_identity
-from backend.services.ingestion_service import create_task, get_task, run_pipeline_and_confirm, run_pipeline_real, _task_to_payload
-from backend.services.kb_service import get_knowledge_bases_payload
+from backend.services.ingestion_service import (
+    SKIPPED_FAST_IMPORT_STAGES,
+    SOURCE_TYPE_BACKUP_CSV,
+    SOURCE_TYPE_FILE,
+    SOURCE_TYPE_WEBPAGE,
+    create_task,
+    get_task,
+    is_allowed_file_document,
+    is_backup_csv_filename,
+    run_pipeline_and_confirm,
+    run_pipeline_real,
+    _task_to_payload,
+)
+from backend.services.kb_service import create_knowledge_base_payload, get_knowledge_bases_payload
 from backend.services.rag_service import run_graph_rag_query, run_rag_query
 from core.chunker import list_strategies
-from core.db.api_keys import ApiKeyAuthResult, ApiKeyError, ApiKeySignaturePayload, authenticate_api_key
+from core.db.api_keys import (
+    ApiKeyAuthResult,
+    ApiKeyError,
+    ApiKeySignaturePayload,
+    acquire_api_key_concurrency_slot,
+    authenticate_api_key,
+    release_api_key_concurrency_slot,
+)
 from core.db.identity import IdentityContext
 from core.db.query_logs import AuditLogRecord, append_audit_log
 from core.parser.provider import PDF_PARSER_CHANNELS
@@ -32,53 +52,169 @@ from core.prompts import LAYOUT_KEY_MAP, SUBJECT_KEY_MAP
 
 
 router = APIRouter()
-
-# 文件上传大小限制:500MB
 MAX_OPENAPI_UPLOAD_SIZE = 500 * 1024 * 1024
-
-# 文档主题类型选项(用于前端下拉框)
 SUBJECT_OPTIONS = [
     {"value": key, "label": label}
     for key, label in SUBJECT_KEY_MAP.items()
 ]
-
-# 文档布局类型选项(用于前端下拉框)
 LAYOUT_OPTIONS = [
     {"value": key, "label": label}
     for key, label in LAYOUT_KEY_MAP.items()
 ]
+SOURCE_TYPE_OPTIONS = [
+    {
+        "value": SOURCE_TYPE_FILE,
+        "label": "file",
+        "description": "Upload PDF, image, or Office files through /openapi/v1/ingestion/upload.",
+        "endpoint": "/openapi/v1/ingestion/upload",
+        "capability": "ingestion.upload.file",
+        "legacyCapability": "ingestion.upload",
+    },
+    {
+        "value": SOURCE_TYPE_WEBPAGE,
+        "label": "webpage",
+        "description": "Submit a webpage crawl task through /openapi/v1/ingestion/webpage.",
+        "endpoint": "/openapi/v1/ingestion/webpage",
+        "capability": "ingestion.webpage",
+    },
+    {
+        "value": SOURCE_TYPE_BACKUP_CSV,
+        "label": "backup_csv",
+        "description": "Restore a wisewe-rag-backup-v1 CSV through /openapi/v1/ingestion/backup-csv.",
+        "endpoint": "/openapi/v1/ingestion/backup-csv",
+        "capability": "ingestion.backup_csv",
+    },
+]
+FILE_DOCUMENT_TYPES = [
+    {"value": "pdf", "extensions": [".pdf"], "description": "PDF document parser pipeline."},
+    {"value": "image", "extensions": [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"], "description": "Image document adapter pipeline."},
+    {"value": "office", "extensions": [".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"], "description": "Office document adapter pipeline."},
+]
+WEBPAGE_LIMITS = {
+    "maxDepth": {"default": 1, "min": 0, "max": 2},
+    "maxPages": {"default": 10, "min": 1, "max": 50},
+    "maxPageBytes": {"default": 2 * 1024 * 1024, "min": 64 * 1024, "max": 5 * 1024 * 1024},
+    "timeoutSeconds": {"default": 12, "min": 3, "max": 30},
+}
 
 
 class OpenApiQueryRequest(BaseModel):
     """OpenAPI 向量检索请求参数"""
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(..., min_length=1, max_length=4000)     # 查询文本
-    kb_id: str | None = Field(default=None, max_length=255)    # 知识库ID
-    top_k: int = Field(default=8, ge=1, le=20)                # 返回数量
-    min_score: float = Field(default=0.3, ge=0.0, le=1.0)    # 最小相似度
-    use_llm_check: bool = False                                # 是否用 LLM 过滤
-    use_llm_score: bool = False                                # 是否用 LLM 评分
+    query: str = Field(..., min_length=1, max_length=4000)
+    kb_id: str | None = Field(default=None, max_length=255)
+    top_k: int = Field(default=8, ge=1, le=20)
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    use_llm_check: bool = False
+    use_llm_score: bool = False
 
 
 class OpenApiGraphQueryRequest(BaseModel):
     """OpenAPI 图谱检索请求参数"""
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(..., min_length=1, max_length=4000)     # 查询文本
-    kb_id: str | None = Field(default=None, max_length=255)    # 知识库ID
-    top_k: int = Field(default=5, ge=1, le=20)                # 返回数量
-    min_score: float = Field(default=0.3, ge=0.0, le=1.0)    # 最小相似度
-    explain: bool = False                                       # 是否返回解释
-    intent: str | None = Field(default=None, max_length=100)   # 用户意图
+    query: str = Field(..., min_length=1, max_length=4000)
+    kb_id: str | None = Field(default=None, max_length=255)
+    top_k: int = Field(default=5, ge=1, le=20)
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    explain: bool = False
+    intent: str | None = Field(default=None, max_length=100)
 
 
 class PromptAppendRequest(BaseModel):
-    """提示词追加请求(用于自定义清洗/质检提示词)"""
+    """提示词追加请求"""
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = Field(default="append", pattern="^append$")    # 模式:只支持追加
-    content: str = Field(..., min_length=1, max_length=2000)   # 提示词内容
+    mode: str = Field(default="append", pattern="^append$")
+    content: str = Field(..., min_length=1, max_length=2000)
+
+
+class OpenApiKnowledgeBaseCreateRequest(BaseModel):
+    """OpenAPI 知识库创建请求参数"""
+    model_config = ConfigDict(extra="forbid")
+
+    kb_id: str | None = Field(default=None, max_length=255)
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+    strategy: str = Field(default="hierarchical", max_length=100)
+
+
+class OpenApiWebpageIngestionRequest(BaseModel):
+    """OpenAPI 网页抓取请求参数"""
+    model_config = ConfigDict(extra="forbid")
+
+    kb_id: str = Field(..., min_length=1, max_length=255)
+    url: str = Field(..., min_length=1, max_length=2048)
+    chunk_strategy: str = Field(default="hierarchical", max_length=100)
+    subject_type: str = Field(default="general", max_length=100)
+    layout_type: str = Field(default="single_column", max_length=100)
+    max_depth: int = Field(default=1, ge=0, le=2)
+    max_pages: int = Field(default=10, ge=1, le=50)
+    same_domain_only: bool = True
+    include_patterns: list[str] = Field(default_factory=list, max_length=20)
+    exclude_patterns: list[str] = Field(default_factory=list, max_length=20)
+    max_page_bytes: int = Field(default=2 * 1024 * 1024, ge=64 * 1024, le=5 * 1024 * 1024)
+    timeout_seconds: int = Field(default=12, ge=3, le=30)
+
+
+OPENAPI_KB_CREATE_EXAMPLE = {
+    "kb_id": "kb_demo",
+    "name": "示例知识库",
+    "description": "用于 OpenAPI 联调的知识库",
+    "strategy": "hierarchical",
+}
+OPENAPI_WEBPAGE_INGESTION_EXAMPLE = {
+    "kb_id": "kb_demo",
+    "url": "https://example.com/docs",
+    "chunk_strategy": "hierarchical",
+    "subject_type": "general",
+    "layout_type": "single_column",
+    "max_depth": 1,
+    "max_pages": 10,
+    "same_domain_only": True,
+    "include_patterns": [],
+    "exclude_patterns": [],
+    "max_page_bytes": 2097152,
+    "timeout_seconds": 12,
+}
+OPENAPI_RAG_QUERY_EXAMPLE = {
+    "query": "请概括这份教材的核心知识点",
+    "kb_id": "kb_demo",
+    "top_k": 8,
+    "min_score": 0.3,
+    "use_llm_check": False,
+    "use_llm_score": False,
+}
+OPENAPI_GRAPH_QUERY_EXAMPLE = {
+    "query": "这份教材里相关概念之间有什么关系？",
+    "kb_id": "kb_demo",
+    "top_k": 5,
+    "min_score": 0.3,
+    "explain": True,
+    "intent": "concept",
+}
+
+
+def _absolute_openapi_image_urls(value: object, request: Request) -> object:
+    if isinstance(value, list):
+        return [_absolute_openapi_image_urls(item, request) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    base_url = str(request.base_url).rstrip("/")
+    output: dict = {}
+    for key, item in value.items():
+        if key == "imageUrl" and isinstance(item, str):
+            lowered = item.lower()
+            if item and not lowered.startswith(("http://", "https://", "data:")):
+                path = item if item.startswith("/") else f"/{item}"
+                output[key] = f"{base_url}{path}"
+            else:
+                output[key] = item
+            continue
+        output[key] = _absolute_openapi_image_urls(item, request)
+    return output
 
 
 @router.get("/openapi/v1/knowledge-bases")
@@ -97,41 +233,7 @@ async def openapi_knowledge_bases(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
-    """
-    查询知识库列表
-
-    根据 API Key 的权限范围,返回可访问的知识库列表。
-    支持按范围、用户、角色过滤。
-
-    参数:
-        scope: 查询范围
-            - mine: 我的知识库
-            - tenant: 租户的所有知识库
-            - all: 所有知识库(需要特殊权限)
-        user_id: 按用户ID过滤
-        role_code: 按角色代码过滤
-        page: 页码,从 1 开始
-        page_size: 每页数量
-
-    认证方式:
-        - Authorization: Bearer <api_key>
-        - 或 X-API-Key: <api_key>
-        - 可选签名验证(通过 X-KB-* 头)
-
-    返回值:
-        JSONResponse: 知识库列表
-            - requestId: 请求ID
-            - data: 包含知识库数组分页数据
-
-    使用场景:
-        - 外部系统查询知识库
-        - 集成到第三方应用
-        - 自动化脚本查询
-
-    错误情况:
-        - 401: API Key 无效
-        - 403: 权限不足
-    """
+    """查询知识库列表"""
     request_id = _request_id()
     guard = _guard_openapi_capability(
         request_id,
@@ -150,31 +252,201 @@ async def openapi_knowledge_bases(
     )
     if isinstance(guard, JSONResponse):
         return guard
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id="*",
+        capability="kb.list",
+        signature=_signature_payload(
+            request=request,
+            body=b"",
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
 
-    items = get_knowledge_bases_payload(guard.identity)
-    allowed = set(guard.kb_ids)
-    filtered = [item for item in items if item.get("id") in allowed]
-    if scope == "mine":
-        filtered = [
-            item for item in filtered
-            if not user_id or str(item.get("ownerUserId") or item.get("createdBy") or "") == user_id
-        ]
-    elif scope == "all" and "kb.list.all" not in guard.capabilities:
-        return _error_response(403, "CAPABILITY_DENIED", "API Key lacks kb.list.all capability", request_id=request_id)
+    try:
+        items = get_knowledge_bases_payload(guard.identity)
+        allowed = set(guard.kb_ids)
+        filtered = items if not allowed else [item for item in items if item.get("id") in allowed]
+        if scope == "mine":
+            filtered = [
+                item for item in filtered
+                if not user_id or str(item.get("ownerUserId") or item.get("createdBy") or "") == user_id
+            ]
+        elif scope == "all" and "kb.list.all" not in guard.capabilities:
+            return _error_response(403, "CAPABILITY_DENIED", "API Key lacks kb.list.all capability", request_id=request_id)
 
-    start = (page - 1) * page_size
-    page_items = filtered[start:start + page_size]
-    data = {
-        "scope": scope,
-        "userId": user_id,
-        "roleCode": role_code,
-        "items": page_items,
-        "total": len(filtered),
-        "page": page,
-        "pageSize": page_size,
-    }
-    return JSONResponse({"requestId": request_id, "data": data})
+        start = (page - 1) * page_size
+        page_items = filtered[start:start + page_size]
+        data = {
+            "scope": scope,
+            "userId": user_id,
+            "roleCode": role_code,
+            "items": page_items,
+            "total": len(filtered),
+            "page": page,
+            "pageSize": page_size,
+        }
+        return JSONResponse({"requestId": request_id, "data": data})
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
 
+
+@router.post("/openapi/v1/knowledge-bases", status_code=201)
+async def openapi_create_knowledge_base(
+    request: Request,
+    payload: OpenApiKnowledgeBaseCreateRequest = Body(..., examples=[OPENAPI_KB_CREATE_EXAMPLE]),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """
+    创建知识库（OpenAPI）
+
+    通过 OpenAPI 接口创建新的知识库。创建成功后可以使用该知识库进行文档导入和 RAG 查询。
+    此接口需要 API Key 认证并强制要求签名验证。
+
+    参数:
+        request: FastAPI 请求对象
+        payload: 知识库创建参数
+            - kb_id: 知识库 ID（可选，不提供则自动生成）
+            - name: 知识库名称（必填，最大 100 字符）
+            - description: 知识库描述（可选，最大 500 字符）
+            - strategy: 切片策略，默认 "hierarchical"
+        authorization: Bearer Token 认证头
+        x_api_key: API Key 认证头（二选一）
+        x_kb_timestamp: 签名时间戳
+        x_kb_nonce: 签名随机数
+        x_kb_body_sha256: 请求体 SHA256 哈希
+        x_kb_signature: 签名值
+        x_forwarded_for: 客户端真实 IP
+
+    返回值:
+        JSONResponse: 创建结果
+            - requestId: 请求 ID
+            - data: 创建的知识库信息
+                - id: 知识库 ID
+                - name: 知识库名称
+                - description: 描述
+                - strategy: 切片策略
+                - createdAt: 创建时间
+
+    使用场景:
+        - 自动化创建知识库
+        - 批量创建知识库
+        - 与其他系统集成
+
+    权限要求:
+        - 需要 kb.create 权限
+        - 强制签名验证
+
+    请求示例:
+        ```bash
+        POST /openapi/v1/knowledge-bases
+        Authorization: Bearer <api_key>
+        X-KB-Timestamp: 1720252800
+        X-KB-Nonce: abc123xyz
+        X-KB-Body-SHA256: e3b0c44298fc1c149afbf4c8996fb924...
+        X-KB-Signature: 3045022100...
+        Content-Type: application/json
+
+        {
+          "kb_id": "kb_demo",
+          "name": "示例知识库",
+          "description": "用于 OpenAPI 联调的知识库",
+          "strategy": "hierarchical"
+        }
+        ```
+
+    响应示例:
+        ```json
+        {
+          "requestId": "req_abc123",
+          "data": {
+            "id": "kb_demo",
+            "name": "示例知识库",
+            "description": "用于 OpenAPI 联调的知识库",
+            "strategy": "hierarchical",
+            "createdAt": "2026-07-06T10:00:00Z"
+          }
+        }
+        ```
+
+    错误情况:
+        - 401: API Key 无效或签名验证失败
+        - 403: 权限不足
+        - 422: 请求参数验证失败
+        - 429: 超过并发限制
+        - 503: 服务不可用
+    """
+    request_id = _request_id()
+    body = await request.body()
+
+    signature = _signature_payload(
+        request=request,
+        body=body,
+        timestamp=x_kb_timestamp,
+        nonce=x_kb_nonce,
+        body_sha256=x_kb_body_sha256,
+        signature=x_kb_signature,
+    )
+    guard = _guard_openapi_capability(
+        request_id,
+        capability="kb.create",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=signature,
+        client_ip=_client_ip(request, x_forwarded_for),
+        force_signature=True,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+
+    kb_id = (payload.kb_id or "").strip() or uuid.uuid4().hex[:24]
+    name = payload.name.strip()
+    if not name:
+        return _error_response(
+            422,
+            "VALIDATION_ERROR",
+            "Request payload validation failed",
+            request_id=request_id,
+            details={"errors": [{"loc": ["name"], "msg": "name cannot be blank"}]},
+        )
+    strategy = _normalize_option(payload.strategy, set(list_strategies()), "hierarchical")
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability="kb.create",
+        signature=signature,
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+
+    try:
+        data = create_knowledge_base_payload(
+            kb_id,
+            name,
+            payload.description.strip(),
+            strategy,
+            guard.identity,
+        )
+        return JSONResponse({"requestId": request_id, "data": data}, status_code=201)
+    except Exception as exc:
+        return _error_response(503, "OPENAPI_KB_CREATE_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
 
 
 @router.get("/openapi/v1/ingestion/options")
@@ -189,28 +461,7 @@ async def openapi_ingestion_options(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
-    """
-    获取文档导入选项配置
-
-    返回所有可用的导入选项,包括切片策略、文档主题类型、文档布局类型、
-    PDF 解析器等。前端可以根据这些选项构建配置界面。
-
-    参数:
-        include_unavailable: 是否包含不可用的选项,默认 True
-
-    返回值:
-        JSONResponse: 可配置选项列表
-            - chunkStrategies: 切片策略列表
-            - subjectTypes: 文档主题类型列表
-            - layoutTypes: 文档布局类型列表
-            - parserProviders: PDF 解析器列表(包含可用性标识)
-            - notes: 重要说明
-
-    使用场景:
-        - 前端获取配置选项
-        - 集成系统查询支持的参数
-        - 检查解析器可用性
-    """
+    """获取文档导入选项配置"""
     request_id = _request_id()
     guard = _guard_openapi_capability(
         request_id,
@@ -229,78 +480,11 @@ async def openapi_ingestion_options(
     )
     if isinstance(guard, JSONResponse):
         return guard
-
-    parser_providers = []
-    for channel in PDF_PARSER_CHANNELS.values():
-        available, reason = _parser_provider_availability(channel.key)
-        if available or include_unavailable:
-            parser_providers.append(
-                {
-                    "value": channel.key,
-                    "label": channel.label,
-                    "description": channel.description,
-                    "available": available,
-                    "reason": reason,
-                }
-            )
-    data = {
-        "chunkStrategies": [{"value": value, "label": _strategy_label(value)} for value in list_strategies()],
-        "subjectTypes": SUBJECT_OPTIONS,
-        "layoutTypes": LAYOUT_OPTIONS,
-        "parserProviders": parser_providers,
-        "notes": [
-            "parser_provider 当前作为 OpenAPI 请求元数据接收；真实执行仍以运行时 PDF_PARSER_PROVIDER 管道为准，单次覆盖需后续管道改造。",
-            "清洗 / 质检提示词第一期只允许 append 型补充，不允许 raw system prompt replace。",
-        ],
-    }
-    return JSONResponse({"requestId": request_id, "data": data})
-
-
-
-@router.get("/openapi/v1/ingestion/tasks/{task_id}")
-async def openapi_ingestion_task(
-    task_id: str,
-    request: Request,
-    authorization: str | None = Header(default=None, alias="Authorization"),
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
-    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
-    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
-    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
-    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
-) -> JSONResponse:
-    """
-    查询导入任务详情
-
-    通过任务 ID 查询导入任务的详细状态和信息。
-
-    参数:
-        task_id: 任务 ID
-
-    返回值:
-        JSONResponse: 任务详情
-            - requestId: 请求ID
-            - data: 任务信息(状态、文件名、策略等)
-
-    使用场景:
-        - 外部系统查询导入进度
-        - 自动化脚本监控任务状态
-        - 回调通知时查询结果
-
-    错误情况:
-        - 404: 任务不存在
-    """
-    request_id = _request_id()
-    task = get_task(task_id)
-    if not task:
-        return _error_response(404, "TASK_NOT_FOUND", "Task not found or not accessible", request_id=request_id)
-    guard = _guard_openapi_call(
-        str(task.get("kb_id") or ""),
-        IdentityContext(),
-        request_id,
-        capability="ingestion.read",
-        authorization=authorization,
-        x_api_key=x_api_key,
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id="*",
+        capability="ingestion.options",
         signature=_signature_payload(
             request=request,
             body=b"",
@@ -311,10 +495,125 @@ async def openapi_ingestion_task(
         ),
         client_ip=_client_ip(request, x_forwarded_for),
     )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+
+    try:
+        parser_providers = []
+        for channel in PDF_PARSER_CHANNELS.values():
+            available, reason = _parser_provider_availability(channel.key)
+            if available or include_unavailable:
+                parser_providers.append(
+                    {
+                        "value": channel.key,
+                        "label": channel.label,
+                        "description": channel.description,
+                        "available": available,
+                        "reason": reason,
+                    }
+                )
+        data = {
+            "sourceTypes": SOURCE_TYPE_OPTIONS,
+            "chunkStrategies": [{"value": value, "label": _strategy_label(value)} for value in list_strategies()],
+            "subjectTypes": SUBJECT_OPTIONS,
+            "layoutTypes": LAYOUT_OPTIONS,
+            "parserProviders": parser_providers,
+            "fileDocumentTypes": FILE_DOCUMENT_TYPES,
+            "webpageLimits": WEBPAGE_LIMITS,
+            "backupCsv": {
+                "schemaVersion": "wisewe-rag-backup-v1",
+                "endpoint": "/openapi/v1/ingestion/backup-csv",
+                "capability": "ingestion.backup_csv",
+                "fastImport": True,
+                "skippedStages": SKIPPED_FAST_IMPORT_STAGES,
+            },
+            "signatureBodyHash": {
+                "json": "Hash the exact JSON bytes sent in the request body.",
+                "file": "For multipart file upload endpoints, hash the uploaded file bytes.",
+                "empty": "GET requests use the SHA-256 of an empty byte string.",
+            },
+            "notes": [
+                "parser_provider 当前作为 OpenAPI 请求元数据接收；真实执行仍以运行时 PDF_PARSER_PROVIDER 管道为准，单次覆盖需后续管道改造。",
+                "清洗 / 质检提示词第一期只允许 append 型补充，不允许 raw system prompt replace。",
+            ],
+        }
+        return JSONResponse({"requestId": request_id, "data": data})
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
+@router.get("/openapi/v1/ingestion/tasks/{task_id}")
+async def openapi_ingestion_task(
+    task_id: str,
+    request: Request,
+    kb_id: str | None = Query(default=None, max_length=255),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """查询导入任务详情"""
+    request_id = _request_id()
+    task = get_task(task_id)
+    if not task:
+        return _error_response(404, "TASK_NOT_FOUND", "Task not found or not accessible", request_id=request_id)
+    task_kb_id = str(task.get("kb_id") or "").strip()
+    requested_kb_id = str(kb_id or "").strip()
+    signature = _signature_payload(
+        request=request,
+        body=b"",
+        timestamp=x_kb_timestamp,
+        nonce=x_kb_nonce,
+        body_sha256=x_kb_body_sha256,
+        signature=x_kb_signature,
+    )
+    client_ip = _client_ip(request, x_forwarded_for)
+    guard = _guard_openapi_capability(
+        request_id,
+        capability="ingestion.read",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=signature,
+        client_ip=client_ip,
+    )
     if isinstance(guard, JSONResponse):
         return guard
-    return JSONResponse({"requestId": request_id, "data": _task_to_payload(task)})
-
+    if guard.kb_ids:
+        if task_kb_id not in guard.kb_ids:
+            return _openapi_kb_binding_denied(
+                guard,
+                request_id=request_id,
+                kb_id=task_kb_id,
+                capability="ingestion.read",
+                signature=signature,
+                client_ip=client_ip,
+            )
+    elif not requested_kb_id or requested_kb_id != task_kb_id:
+        return _openapi_kb_binding_denied(
+            guard,
+            request_id=request_id,
+            kb_id=task_kb_id,
+            capability="ingestion.read",
+            signature=signature,
+            client_ip=client_ip,
+        )
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=task_kb_id,
+        capability="ingestion.read",
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+    try:
+        return JSONResponse({"requestId": request_id, "data": _task_to_payload(task)})
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
 
 
 @router.post("/openapi/v1/ingestion/upload", status_code=202)
@@ -340,51 +639,14 @@ async def openapi_ingestion_upload(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
-    """
-    通过 OpenAPI 上传 PDF 文档
-
-    这是外部系统集成的主要入口,用于上传 PDF 并启动处理流程。
-    支持自定义切片策略、清洗提示词、质检提示词等参数。
-
-    参数:
-        file: 上传的 PDF 文件
-        kb_id: 目标知识库 ID(必填)
-        chunk_strategy: 切片策略,默认 "hierarchical"
-        subject_type: 文档主题类型,默认 "general"
-        layout_type: 文档布局类型,默认 "single_column"
-        parser_provider: PDF 解析器(可选)
-        auto_confirm: 是否自动确认,默认 False
-        cleaning_prompt_mode: 清洗提示词模式(只支持 "append")
-        cleaning_prompt_content: 清洗提示词内容
-        quality_prompt_mode: 质检提示词模式(只支持 "append")
-        quality_prompt_content: 质检提示词内容
-
-    认证方式:
-        - 必须使用 API Key 认证
-        - 强制要求签名验证(通过 X-KB-* 头)
-
-    返回值:
-        JSONResponse: 任务信息
-            - requestId: 请求ID
-            - data: 包含 taskId、状态等
-
-    使用场景:
-        - 外部系统自动化导入
-        - 批量文档处理
-        - 集成到业务流程
-
-    错误情况:
-        - 401: API Key 无效或签名验证失败
-        - 403: 权限不足
-        - 422: 文件格式错误或文件过大
-    """
+    """通过 OpenAPI 上传文档"""
     request_id = _request_id()
     content = await file.read()
     guard = _guard_openapi_call(
         kb_id,
         IdentityContext(),
         request_id,
-        capability="ingestion.upload",
+        capability=("ingestion.upload.file", "ingestion.upload"),
         authorization=authorization,
         x_api_key=x_api_key,
         signature=_signature_payload(
@@ -400,70 +662,93 @@ async def openapi_ingestion_upload(
     )
     if isinstance(guard, JSONResponse):
         return guard
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability="ingestion.upload",
+        signature=_signature_payload(
+            request=request,
+            body=content,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
     identity = guard.identity if isinstance(guard, ApiKeyAuthResult) else None
 
-    prompt_policy, prompt_error = _validate_prompt_overrides(
-        cleaning_prompt_mode=cleaning_prompt_mode,
-        cleaning_prompt_content=cleaning_prompt_content,
-        quality_prompt_mode=quality_prompt_mode,
-        quality_prompt_content=quality_prompt_content,
-        capabilities=guard.capabilities,
-    )
-    if prompt_error:
-        return _error_response(403, "PROMPT_OVERRIDE_DENIED", prompt_error, request_id=request_id)
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        return _error_response(422, "VALIDATION_ERROR", "Only PDF files are supported", request_id=request_id)
-    if len(content) > MAX_OPENAPI_UPLOAD_SIZE:
-        return _error_response(422, "PAYLOAD_TOO_LARGE", "File size cannot exceed 500MB", request_id=request_id)
+    try:
+        prompt_policy, prompt_error = _validate_prompt_overrides(
+            cleaning_prompt_mode=cleaning_prompt_mode,
+            cleaning_prompt_content=cleaning_prompt_content,
+            quality_prompt_mode=quality_prompt_mode,
+            quality_prompt_content=quality_prompt_content,
+            capabilities=guard.capabilities,
+        )
+        if prompt_error:
+            return _error_response(403, "PROMPT_OVERRIDE_DENIED", prompt_error, request_id=request_id)
+        if not file.filename or not is_allowed_file_document(file.filename):
+            return _error_response(422, "VALIDATION_ERROR", "Only PDF, image and Office files are supported", request_id=request_id)
+        if len(content) > MAX_OPENAPI_UPLOAD_SIZE:
+            return _error_response(422, "PAYLOAD_TOO_LARGE", "File size cannot exceed 500MB", request_id=request_id)
 
-    strategy = _normalize_option(chunk_strategy, set(list_strategies()), "hierarchical")
-    subject = _normalize_option(subject_type, set(SUBJECT_KEY_MAP), "general")
-    layout = _normalize_option(layout_type, set(LAYOUT_KEY_MAP), "single_column")
-    task_id = create_task(
-        kb_id,
-        file.filename,
-        strategy,
-        file_bytes=content,
-        subject_type=subject,
-        layout_type=layout,
-        identity=identity,
-    )
-    task = get_task(task_id)
-    if task is not None:
-        task["openapi"] = {
-            "request_id": request_id,
-            "api_key_id": guard.api_key_id,
-            "parser_provider_requested": parser_provider or "",
-            "prompt_policy": prompt_policy,
+        strategy = _normalize_option(chunk_strategy, set(list_strategies()), "hierarchical")
+        subject = _normalize_option(subject_type, set(SUBJECT_KEY_MAP), "general")
+        layout = _normalize_option(layout_type, set(LAYOUT_KEY_MAP), "single_column")
+        task_id = create_task(
+            kb_id,
+            file.filename,
+            strategy,
+            file_bytes=content,
+            subject_type=subject,
+            layout_type=layout,
+            identity=identity,
+            source_type=SOURCE_TYPE_FILE,
+            source_summary=file.filename,
+        )
+        task = get_task(task_id)
+        if task is not None:
+            task["openapi"] = {
+                "request_id": request_id,
+                "api_key_id": guard.api_key_id,
+                "parser_provider_requested": parser_provider or "",
+                "prompt_policy": prompt_policy,
+            }
+            from backend.services.task_store import save_task
+
+            save_task(task)
+        if auto_confirm:
+            background_tasks.add_task(run_pipeline_and_confirm, task_id)
+        else:
+            background_tasks.add_task(run_pipeline_real, task_id)
+        data = {
+            "taskId": task_id,
+            "kbId": kb_id,
+            "status": "pending",
+            "filename": file.filename,
+            "strategy": strategy,
+            "subjectType": subject,
+            "layoutType": layout,
+            "parserProviderRequested": parser_provider or "",
+            "parserProviderEffective": "runtime PDF_PARSER_PROVIDER",
+            "autoConfirm": auto_confirm,
+            "sourceType": SOURCE_TYPE_FILE,
+            "promptPolicy": prompt_policy,
         }
-        from backend.services.task_store import save_task
-
-        save_task(task)
-    if auto_confirm:
-        background_tasks.add_task(run_pipeline_and_confirm, task_id)
-    else:
-        background_tasks.add_task(run_pipeline_real, task_id)
-    data = {
-        "taskId": task_id,
-        "kbId": kb_id,
-        "status": "pending",
-        "filename": file.filename,
-        "strategy": strategy,
-        "subjectType": subject,
-        "layoutType": layout,
-        "parserProviderRequested": parser_provider or "",
-        "parserProviderEffective": "runtime PDF_PARSER_PROVIDER",
-        "autoConfirm": auto_confirm,
-        "promptPolicy": prompt_policy,
-    }
-    return JSONResponse({"requestId": request_id, "data": data}, status_code=202)
+        return JSONResponse({"requestId": request_id, "data": data}, status_code=202)
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
 
 
-
-@router.post("/openapi/v1/rag/query")
-async def openapi_rag_query(
+@router.post("/openapi/v1/ingestion/webpage", status_code=202)
+async def openapi_ingestion_webpage(
     request: Request,
-    identity: IdentityContext = Depends(get_current_identity),
+    background_tasks: BackgroundTasks,
+    payload: OpenApiWebpageIngestionRequest = Body(..., examples=[OPENAPI_WEBPAGE_INGESTION_EXAMPLE]),
     authorization: str | None = Header(default=None, alias="Authorization"),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
@@ -472,45 +757,192 @@ async def openapi_rag_query(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
-    """
-    OpenAPI 向量检索接口
-
-    在指定知识库中进行向量相似度检索,返回与查询文本最相关的文档片段。
-    这是 RAG 系统的核心查询接口。
-
-    请求体参数:
-        query: 查询文本(必填,最长 4000 字符)
-        kb_id: 知识库 ID
-        top_k: 返回数量,默认 8,最大 20
-        min_score: 最小相似度,默认 0.3
-        use_llm_check: 是否用 LLM 过滤结果
-        use_llm_score: 是否用 LLM 重新评分
-
-    返回值:
-        JSONResponse: 检索结果
-            - requestId: 请求ID
-            - data: 包含匹配的文档片段列表
-
-    使用场景:
-        - 外部系统集成 RAG 能力
-        - 构建智能问答机器人
-        - 文档搜索功能
-
-    错误情况:
-        - 401: API Key 无效
-        - 403: 权限不足
-        - 404: 知识库不存在
-        - 503: 查询失败
-    """
+    """网页抓取导入"""
     request_id = _request_id()
     body = await request.body()
-    try:
-        payload = OpenApiQueryRequest.model_validate_json(body or b"{}")
-    except ValidationError as exc:
-        return validation_error_response(exc.errors())
     guard = _guard_openapi_call(
         payload.kb_id,
-        identity,
+        IdentityContext(),
+        request_id,
+        capability="ingestion.webpage",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=_signature_payload(
+            request=request,
+            body=body,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+        force_signature=True,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=payload.kb_id,
+        capability="ingestion.webpage",
+        signature=_signature_payload(
+            request=request,
+            body=body,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+    identity = guard.identity if isinstance(guard, ApiKeyAuthResult) else None
+    try:
+        strategy = _normalize_option(payload.chunk_strategy, set(list_strategies()), "hierarchical")
+        subject = _normalize_option(payload.subject_type, set(SUBJECT_KEY_MAP), "general")
+        layout = _normalize_option(payload.layout_type, set(LAYOUT_KEY_MAP), "single_column")
+        task_id = create_task(
+            payload.kb_id,
+            payload.url,
+            strategy,
+            subject_type=subject,
+            layout_type=layout,
+            identity=identity,
+            source_type=SOURCE_TYPE_WEBPAGE,
+            source_summary=payload.url,
+            source_url=payload.url,
+            source_options=payload.model_dump(),
+        )
+        background_tasks.add_task(run_pipeline_real, task_id)
+        return JSONResponse(
+            {
+                "requestId": request_id,
+                "data": {
+                    "taskId": task_id,
+                    "kbId": payload.kb_id,
+                    "status": "pending",
+                    "url": payload.url,
+                    "strategy": strategy,
+                    "subjectType": subject,
+                    "layoutType": layout,
+                    "sourceType": SOURCE_TYPE_WEBPAGE,
+                },
+            },
+            status_code=202,
+        )
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
+@router.post("/openapi/v1/ingestion/backup-csv", status_code=202)
+async def openapi_ingestion_backup_csv(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    kb_id: str = Form(..., max_length=255),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """备份 CSV 导入"""
+    request_id = _request_id()
+    content = await file.read()
+    guard = _guard_openapi_call(
+        kb_id,
+        IdentityContext(),
+        request_id,
+        capability="ingestion.backup_csv",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=_signature_payload(
+            request=request,
+            body=content,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+        force_signature=True,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability="ingestion.backup_csv",
+        signature=_signature_payload(
+            request=request,
+            body=content,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+    identity = guard.identity if isinstance(guard, ApiKeyAuthResult) else None
+    try:
+        if not file.filename or not is_backup_csv_filename(file.filename):
+            return _error_response(422, "VALIDATION_ERROR", "Only system backup CSV files are supported", request_id=request_id)
+        if len(content) > MAX_OPENAPI_UPLOAD_SIZE:
+            return _error_response(422, "PAYLOAD_TOO_LARGE", "File size cannot exceed 500MB", request_id=request_id)
+        task_id = create_task(
+            kb_id,
+            file.filename,
+            "backup_csv",
+            file_bytes=content,
+            identity=identity,
+            source_type=SOURCE_TYPE_BACKUP_CSV,
+            source_summary=file.filename,
+            fast_import=True,
+            skipped_stages=SKIPPED_FAST_IMPORT_STAGES,
+        )
+        background_tasks.add_task(run_pipeline_real, task_id)
+        return JSONResponse(
+            {
+                "requestId": request_id,
+                "data": {
+                    "taskId": task_id,
+                    "kbId": kb_id,
+                    "status": "pending",
+                    "filename": file.filename,
+                    "sourceType": SOURCE_TYPE_BACKUP_CSV,
+                    "skippedStages": SKIPPED_FAST_IMPORT_STAGES,
+                },
+            },
+            status_code=202,
+        )
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
+@router.post("/openapi/v1/rag/query")
+async def openapi_rag_query(
+    request: Request,
+    payload: OpenApiQueryRequest = Body(..., examples=[OPENAPI_RAG_QUERY_EXAMPLE]),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """OpenAPI 向量检索接口"""
+    request_id = _request_id()
+    body = await request.body()
+    guard = _guard_openapi_call(
+        payload.kb_id,
+        IdentityContext(),
         request_id,
         capability="rag.query",
         authorization=authorization,
@@ -531,6 +963,23 @@ async def openapi_rag_query(
     if isinstance(guard, ApiKeyAuthResult):
         auth_result = guard
         identity = auth_result.identity
+    concurrency = _acquire_openapi_concurrency_or_error(
+        auth_result,
+        request_id=request_id,
+        kb_id=payload.kb_id,
+        capability="rag.query",
+        signature=_signature_payload(
+            request=request,
+            body=body,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
 
     query_payload = QueryRequest(
         query=payload.query,
@@ -546,15 +995,17 @@ async def openapi_rag_query(
         return _error_response(404, "KB_NOT_FOUND", str(exc), request_id=request_id)
     except Exception as exc:
         return _error_response(503, "OPENAPI_QUERY_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(auth_result, concurrency)
+    result = _absolute_openapi_image_urls(result, request)
     result["requestId"] = request_id
     return JSONResponse({"requestId": request_id, "data": result})
-
 
 
 @router.post("/openapi/v1/rag/graph-query")
 async def openapi_graph_rag_query(
     request: Request,
-    identity: IdentityContext = Depends(get_current_identity),
+    payload: OpenApiGraphQueryRequest = Body(..., examples=[OPENAPI_GRAPH_QUERY_EXAMPLE]),
     authorization: str | None = Header(default=None, alias="Authorization"),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
@@ -563,45 +1014,12 @@ async def openapi_graph_rag_query(
     x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
     x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
 ) -> JSONResponse:
-    """
-    OpenAPI 图谱检索接口
-
-    结合知识图谱进行检索,不仅返回相似文档片段,还提供实体关系和推理路径。
-    相比向量检索,图谱检索能提供更结构化、更可解释的结果。
-
-    请求体参数:
-        query: 查询文本(必填,最长 4000 字符)
-        kb_id: 知识库 ID
-        top_k: 返回数量,默认 5,最大 20
-        min_score: 最小相似度,默认 0.3
-        explain: 是否返回推理路径解释
-        intent: 用户意图(可选)
-
-    返回值:
-        JSONResponse: 图谱检索结果
-            - requestId: 请求ID
-            - data: 包含匹配片段、实体关系、推理路径
-
-    使用场景:
-        - 需要理解实体关系的查询
-        - 需要可解释性的检索结果
-        - 复杂知识推理场景
-
-    错误情况:
-        - 401: API Key 无效
-        - 403: 权限不足
-        - 404: 知识库不存在
-        - 503: 查询失败
-    """
+    """OpenAPI 图谱检索接口"""
     request_id = _request_id()
     body = await request.body()
-    try:
-        payload = OpenApiGraphQueryRequest.model_validate_json(body or b"{}")
-    except ValidationError as exc:
-        return validation_error_response(exc.errors())
     guard = _guard_openapi_call(
         payload.kb_id,
-        identity,
+        IdentityContext(),
         request_id,
         capability="rag.graph_query",
         authorization=authorization,
@@ -618,8 +1036,26 @@ async def openapi_graph_rag_query(
     )
     if isinstance(guard, JSONResponse):
         return guard
+    auth_result = guard if isinstance(guard, ApiKeyAuthResult) else None
     if isinstance(guard, ApiKeyAuthResult):
         identity = guard.identity
+    concurrency = _acquire_openapi_concurrency_or_error(
+        auth_result,
+        request_id=request_id,
+        kb_id=payload.kb_id,
+        capability="rag.graph_query",
+        signature=_signature_payload(
+            request=request,
+            body=body,
+            timestamp=x_kb_timestamp,
+            nonce=x_kb_nonce,
+            body_sha256=x_kb_body_sha256,
+            signature=x_kb_signature,
+        ),
+        client_ip=_client_ip(request, x_forwarded_for),
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
 
     graph_payload = GraphQueryRequest(
         query=payload.query,
@@ -635,6 +1071,9 @@ async def openapi_graph_rag_query(
         return _error_response(404, "KB_NOT_FOUND", str(exc), request_id=request_id)
     except Exception as exc:
         return _error_response(503, "OPENAPI_GRAPH_QUERY_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(auth_result, concurrency)
+    result = _absolute_openapi_image_urls(result, request)
     result["requestId"] = request_id
     return JSONResponse({"requestId": request_id, "data": result})
 
@@ -644,7 +1083,7 @@ def _guard_openapi_call(
     identity: IdentityContext,
     request_id: str,
     *,
-    capability: str,
+    capability: str | tuple[str, ...],
     authorization: str | None = None,
     x_api_key: str | None = None,
     signature: ApiKeySignaturePayload | None = None,
@@ -653,28 +1092,35 @@ def _guard_openapi_call(
 ) -> JSONResponse | ApiKeyAuthResult | None:
     if not (kb_id or "").strip():
         return _error_response(400, "KB_ID_REQUIRED", "kb_id is required for OpenAPI calls", request_id=request_id)
+    capabilities = (capability,) if isinstance(capability, str) else tuple(capability)
+    if not capabilities:
+        return _error_response(403, "CAPABILITY_DENIED", "API Key lacks the required capability", request_id=request_id)
     api_key = _extract_api_key(authorization, x_api_key)
     if api_key:
-        try:
-            result = authenticate_api_key(
-                api_key,
-                kb_id=kb_id or "",
-                capability=capability,
-                signature=signature,
-                client_ip=client_ip,
-                force_signature=force_signature,
-            )
-            return result
-        except ApiKeyError as exc:
-            _audit_openapi_denied(
-                exc,
-                request_id=request_id,
-                kb_id=kb_id,
-                capability=capability,
-                signature=signature,
-                client_ip=client_ip,
-            )
-            return _error_response(_api_key_status(exc.code), exc.code, exc.message, request_id=request_id)
+        for index, item in enumerate(capabilities):
+            try:
+                result = authenticate_api_key(
+                    api_key,
+                    kb_id=kb_id or "",
+                    capability=item,
+                    signature=signature,
+                    client_ip=client_ip,
+                    force_signature=force_signature,
+                )
+                return result
+            except ApiKeyError as exc:
+                can_try_next = exc.code == "CAPABILITY_DENIED" and index < len(capabilities) - 1
+                if can_try_next:
+                    continue
+                _audit_openapi_denied(
+                    exc,
+                    request_id=request_id,
+                    kb_id=kb_id,
+                    capability=item,
+                    signature=signature,
+                    client_ip=client_ip,
+                )
+                return _error_response(_api_key_status(exc.code), exc.code, exc.message, request_id=request_id)
     if not identity.enforce_access:
         return _error_response(
             401,
@@ -693,6 +1139,7 @@ def _guard_openapi_capability(
     x_api_key: str | None = None,
     signature: ApiKeySignaturePayload | None = None,
     client_ip: str | None = None,
+    force_signature: bool = False,
 ) -> JSONResponse | ApiKeyAuthResult:
     api_key = _extract_api_key(authorization, x_api_key)
     if not api_key:
@@ -709,6 +1156,7 @@ def _guard_openapi_capability(
             capability=capability,
             signature=signature,
             client_ip=client_ip,
+            force_signature=force_signature,
         )
     except ApiKeyError as exc:
         _audit_openapi_denied(
@@ -720,6 +1168,144 @@ def _guard_openapi_capability(
             client_ip=client_ip,
         )
         return _error_response(_api_key_status(exc.code), exc.code, exc.message, request_id=request_id)
+
+
+def _openapi_kb_binding_denied(
+    auth_result: ApiKeyAuthResult,
+    *,
+    request_id: str,
+    kb_id: str | None,
+    capability: str,
+    signature: ApiKeySignaturePayload | None,
+    client_ip: str | None,
+) -> JSONResponse:
+    exc = ApiKeyError(
+        "KB_BINDING_DENIED",
+        "API Key is not bound to this knowledge base",
+        api_key_id=auth_result.api_key_id,
+    )
+    _audit_openapi_denied(
+        exc,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability=capability,
+        signature=signature,
+        client_ip=client_ip,
+    )
+    return _error_response(403, exc.code, exc.message, request_id=request_id)
+
+
+def _acquire_openapi_concurrency_or_error(
+    auth_result: ApiKeyAuthResult | None,
+    *,
+    request_id: str,
+    kb_id: str | None,
+    capability: str,
+    signature: ApiKeySignaturePayload | None,
+    client_ip: str | None,
+) -> bool | JSONResponse:
+    """
+    获取 OpenAPI 并发槽位
+
+    尝试为当前 API Key 获取一个并发槽位，用于并发控制。
+    如果 API Key 配置了并发限制且已达到上限，则返回错误响应。
+
+    并发控制机制：
+    1. 每个 API Key 可以配置最大并发数（concurrentLimit）
+    2. 每个请求开始时获取槽位，结束时释放
+    3. 超过限制的请求返回 429 错误
+
+    参数:
+        auth_result: API Key 认证结果，包含并发限制配置
+        request_id: 请求 ID，用于日志追踪
+        kb_id: 知识库 ID
+        capability: 请求的能力权限
+        signature: 签名信息（用于审计日志）
+        client_ip: 客户端 IP
+
+    返回值:
+        bool | JSONResponse:
+            - True: 成功获取槽位
+            - False: 无需并发控制（未配置限制）
+            - JSONResponse: 并发超限错误响应
+
+    使用场景:
+        - OpenAPI 接口的并发控制
+        - 防止 API Key 滥用
+        - 保护系统资源
+
+    错误响应示例:
+        ```json
+        {
+          "requestId": "req_abc123",
+          "error": {
+            "code": "CONCURRENCY_LIMITED",
+            "message": "API Key has reached concurrency limit",
+            "details": {
+              "limit": 10,
+              "current": 10
+            }
+          }
+        }
+        ```
+
+    注意事项:
+        - 获取槽位后必须调用 _release_openapi_concurrency 释放
+        - 建议在 try-finally 块中确保释放
+    """
+    if auth_result is None or auth_result.concurrent_limit <= 0:
+        return False
+    try:
+        return acquire_api_key_concurrency_slot(auth_result.api_key_id, auth_result.concurrent_limit)
+    except ApiKeyError as exc:
+        _audit_openapi_denied(
+            exc,
+            request_id=request_id,
+            kb_id=kb_id,
+            capability=capability,
+            signature=signature,
+            client_ip=client_ip,
+        )
+        return _error_response(_api_key_status(exc.code), exc.code, exc.message, request_id=request_id)
+
+
+def _release_openapi_concurrency(auth_result: ApiKeyAuthResult | None, acquired: bool | JSONResponse) -> None:
+    """
+    释放 OpenAPI 并发槽位
+
+    释放之前获取的并发槽位，允许其他请求使用。
+    这是并发控制的清理函数，必须在请求结束时调用。
+
+    参数:
+        auth_result: API Key 认证结果
+        acquired: 槽位获取结果（来自 _acquire_openapi_concurrency_or_error）
+            - True: 之前成功获取了槽位，需要释放
+            - False 或 JSONResponse: 未获取槽位，无需操作
+
+    使用场景:
+        - OpenAPI 请求结束时释放资源
+        - 确保 finally 块中调用以防止资源泄漏
+
+    代码示例:
+        ```python
+        concurrency = _acquire_openapi_concurrency_or_error(...)
+        if isinstance(concurrency, JSONResponse):
+            return concurrency
+        try:
+            # 执行业务逻辑
+            return do_something()
+        finally:
+            _release_openapi_concurrency(auth_result, concurrency)
+        ```
+
+    注意事项:
+        - 必须在 try-finally 中调用，确保异常时也能释放
+        - 只释放成功获取的槽位（acquired == True）
+        - 重复释放是安全的（不会产生副作用）
+    """
+    if auth_result is None or not isinstance(acquired, bool) or not acquired:
+        return
+    release_api_key_concurrency_slot(auth_result.api_key_id)
 
 
 def _extract_api_key(authorization: str | None, x_api_key: str | None) -> str:
@@ -741,14 +1327,19 @@ def _signature_payload(
     body_sha256: str | None,
     signature: str | None,
 ) -> ApiKeySignaturePayload:
+    raw_query = str(request.url.query or "")
+    path = request.url.path
+    path_with_query = f"{path}?{raw_query}" if raw_query else path
+    alternate_paths = (path,) if path_with_query != path else ()
     return ApiKeySignaturePayload(
         method=request.method,
-        path=request.url.path,
+        path=path_with_query,
         body=body,
         timestamp=timestamp,
         nonce=nonce,
         body_sha256=body_sha256,
         signature=signature,
+        alternate_paths=alternate_paths,
     )
 
 
@@ -768,9 +1359,7 @@ def _api_key_status(code: str) -> int:
         return 401
     if code == "IP_NOT_ALLOWED":
         return 403
-    if code == "RATE_LIMITED":
-        return 429
-    if code == "QUOTA_EXCEEDED":
+    if code in {"RATE_LIMITED", "QUOTA_EXCEEDED", "CONCURRENCY_LIMITED", "MONTHLY_QUOTA_EXCEEDED"}:
         return 429
     if code == "KB_ID_REQUIRED":
         return 400
@@ -830,7 +1419,14 @@ def _openapi_denied_risk(code: str) -> str:
         "IP_NOT_ALLOWED",
     }:
         return "high"
-    if code in {"RATE_LIMITED", "QUOTA_EXCEEDED", "CAPABILITY_DENIED", "KB_BINDING_DENIED"}:
+    if code in {
+        "RATE_LIMITED",
+        "QUOTA_EXCEEDED",
+        "CONCURRENCY_LIMITED",
+        "MONTHLY_QUOTA_EXCEEDED",
+        "CAPABILITY_DENIED",
+        "KB_BINDING_DENIED",
+    }:
         return "medium"
     return "low"
 
@@ -929,10 +1525,29 @@ def _error_response(
     return JSONResponse(payload, status_code=status_code)
 
 
+def _json_safe_error_value(value: object) -> object:
+    if isinstance(value, bytes):
+        return "<redacted bytes>"
+    if isinstance(value, bytearray):
+        return "<redacted bytes>"
+    if isinstance(value, dict):
+        return {
+            str(key): ("<redacted>" if key == "input" else _json_safe_error_value(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_json_safe_error_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe_error_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def validation_error_response(exc_errors: list[dict]) -> JSONResponse:
     return _error_response(
         status_code=422,
         code="VALIDATION_ERROR",
         message="Request payload validation failed",
-        details={"errors": exc_errors},
+        details={"errors": _json_safe_error_value(exc_errors)},
     )

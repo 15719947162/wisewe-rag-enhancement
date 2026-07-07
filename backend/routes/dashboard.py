@@ -7,15 +7,18 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from backend.services.identity_service import get_current_identity
+from backend.services.kb_service import get_knowledge_bases_payload
 from core.db.connection import get_db_connection
+from core.db.identity import IdentityContext
 
 router = APIRouter()
 
 
 @router.get("/api/dashboard/stats")
-def dashboard_stats() -> dict:
+def dashboard_stats(identity: IdentityContext = Depends(get_current_identity)) -> dict:
     """
     获取仪表板统计数据
 
@@ -43,12 +46,12 @@ def dashboard_stats() -> dict:
         - 503: 数据库连接失败或查询出错
     """
     try:
-        return _live_stats()
+        return _live_stats(identity if identity.enforce_access else None)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-def _live_stats() -> dict:
+def _live_stats(identity: IdentityContext | None = None) -> dict:
     """
     内部函数:从数据库获取实时统计数据
 
@@ -58,35 +61,39 @@ def _live_stats() -> dict:
     返回值:
         dict: 格式化后的统计数据
     """
+    visible_kbs = get_knowledge_bases_payload(identity)
+    visible_kb_ids = [str(item["id"]) for item in visible_kbs]
+    if not visible_kb_ids:
+        return {
+            "kb_count": 0,
+            "doc_count": 0,
+            "chunk_count": 0,
+            "recent_tasks": [],
+        }
+
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # 查询知识库总数
-            cur.execute("SELECT COUNT(*) FROM knowledge_bases")
-            kb_count = cur.fetchone()[0]
-
-            # 查询文档总数
-            cur.execute("SELECT COUNT(*) FROM documents")
+            cur.execute("SELECT COUNT(*) FROM documents WHERE kb_id = ANY(%s)", (visible_kb_ids,))
             doc_count = cur.fetchone()[0]
 
-            # 查询切片总数(对所有文档的切片数求和)
-            cur.execute("SELECT COALESCE(SUM(chunk_count), 0) FROM documents")
+            cur.execute("SELECT COALESCE(SUM(chunk_count), 0) FROM documents WHERE kb_id = ANY(%s)", (visible_kb_ids,))
             chunk_count = cur.fetchone()[0]
 
-            # 查询最近10条文档记录
             cur.execute(
                 """
                 SELECT id, kb_id, filename, updated_at
                 FROM documents
+                WHERE kb_id = ANY(%s)
                 ORDER BY updated_at DESC
                 LIMIT 10
-                """
+                """,
+                (visible_kb_ids,),
             )
             rows = cur.fetchall()
     finally:
         conn.close()
 
-    # 将数据库记录转换为前端需要的格式
     recent_tasks = [
         {
             "id": str(r[0]),
@@ -99,7 +106,7 @@ def _live_stats() -> dict:
     ]
 
     return {
-        "kb_count": kb_count,
+        "kb_count": len(visible_kbs),
         "doc_count": doc_count,
         "chunk_count": int(chunk_count),
         "recent_tasks": recent_tasks,

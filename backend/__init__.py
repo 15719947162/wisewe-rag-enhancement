@@ -49,14 +49,10 @@ uvicorn backend.app:app --reload --port 8000
 | routes/ | HTTP 路由定义，每个文件对应一类业务接口 |
 | schemas/ | Pydantic 模型，定义请求和响应的数据格式 |
 | services/ | 业务服务编排，协调多个核心模块完成复杂流程 |
-| adapters/ | 适配器，将 HTTP 调用转换为对 core 模块的调用 |
+| adapters/ | 适配器，将 HTTP 用用转换为对 core 模块的调用 |
 
 ## 与 CLI 的区别
 
 - **backend/**：HTTP 服务模式，支持前后端联调、实时交互
 - **main.py + backend/cli.py**：命令行模式，适合批量处理、脚本运行
 """
-
-# backend/ 是一个纯包，没有需要导出的符号
-__all__: list[str] = []
-

@@ -373,21 +373,8 @@ def main() -> None:
 
     # 遍历每个策略
     for name in strategies:
-        print(f"  === 策略: {name} ===")
-
-        # ============================================================================
-        # Stage 3: 切片（Chunk）
-        # ============================================================================
-        # 获取切片策略实例
-        # get_strategy 根据名称返回对应的策略类实例
-
         # 层次化切片需要额外参数（增强提示词）
-        extra = {}
-        if name == "hierarchical":
-            # 层次化切片会生成 LLM 摘要（增强切片）
-            # 需要指定系统提示词
-            if args.enhanced_system_prompt:
-                extra["enhanced_system_prompt"] = args.enhanced_system_prompt
+        extra = {"enhanced_system_prompt": args.enhanced_system_prompt} if name == "hierarchical" else {}
 
         # 创建策略实例
         strategy = get_strategy(name, **extra)

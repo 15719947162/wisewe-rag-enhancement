@@ -415,6 +415,11 @@ def fetch_document_export_record(document_id: str) -> dict[str, Any] | None:
                            ),
                            '[]'::json
                        ) AS triples
+                       -- 新增字段：将 embedding 向量转换为文本格式以便传输
+                       -- 用途：导出切片数据时包含向量嵌入，支持向量数据库迁移和离线分析
+                       -- 数据流：chunks.embedding (vector 类型) -> text -> JSON 响应 -> 前端/导出文件
+                       -- 注意：PostgreSQL 的 vector 类型无法直接序列化为 JSON，需显式转换为 text
+                       , c.embedding::text AS embedding_text
                 FROM chunks c
                 WHERE c.document_id = %s
                 ORDER BY c.chunk_index ASC, c.created_at ASC
@@ -461,6 +466,14 @@ def fetch_document_export_record(document_id: str) -> dict[str, Any] | None:
                 "created_at": row[17],
                 "relations": row[18] if isinstance(row[18], list) else [],
                 "triples": row[19] if isinstance(row[19], list) else [],
+                # 新增字段：切片的向量嵌入（文本格式）
+                # 用途：
+                # 1. 导出功能：允许用户导出带有向量的完整切片数据
+                # 2. 数据迁移：支持将切片数据迁移到其他向量数据库（如 Milvus、Pinecone）
+                # 3. 离线分析：便于对向量数据进行批量分析和处理
+                # 数据格式：字符串表示的向量数组，如 "[0.1, 0.2, 0.3, ...]"
+                # 使用场景：知识库导出、数据备份、跨系统迁移、向量质量分析
+                "embedding": row[20] or "",
             }
             for row in chunk_rows
         ],

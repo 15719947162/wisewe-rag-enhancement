@@ -33,6 +33,10 @@ from core.http_client import create_openai_client
 from core.llm_config import resolve_llm_param
 from core.llm_usage import TokenUsage
 from core.models.content_block import Chunk
+# 导入系统提示词相关的工具：
+# - QUALITY_GATE_SYSTEM_PROMPT_DEFAULT: 默认的质量门控提示词（UTF-8 编码的正确中文）
+# - normalize_quality_gate_system_prompt(): 标准化提示词，修复编码问题
+from core.runtime_settings import QUALITY_GATE_SYSTEM_PROMPT_DEFAULT, normalize_quality_gate_system_prompt
 
 
 @dataclass
@@ -336,6 +340,34 @@ def _llm_score_chunks(
             "返回 JSON 数组，每项：{\"index\": 序号, \"score\": 分数, \"reason\": \"一句话理由\"}"
         ),
     )
+
+    # ========== 系统提示词编码问题验证 ==========
+    # 【为什么要检测编码问题？】
+    # 在某些环境下（如 Windows 控制台、某些编辑器），中文字符可能被错误编码。
+    # 例如：
+    # - "你是" 的 UTF-8 字节序列 (0xE4 0xBD 0xA0 0xE6 0x98 0xAF) 被误读为 GBK，会显示为"浣犳槸"
+    # - 标点符号"：" 的 UTF-8 字节 (0xEF 0xBC 0x9A) 被误读为 GBK，会显示为"锛"
+    # - 引号""" 的 UTF-8 字节被误读，会包含"銆"等乱码字符
+    #
+    # 【编码问题的来源】
+    # 1. 环境变量从终端读取时编码不一致（终端是 GBK，但内容是 UTF-8）
+    # 2. 配置文件保存时使用了错误的编码
+    # 3. 从数据库或其他系统读取时编码转换错误
+    #
+    # 【检测特定字符的原因】
+    # "浣犳槸" 是"你是" 的 GBK 误读，这是系统提示词中最常见的开头
+    # "銆" 常出现在标点符号被错误编码时（如冒号、引号等）
+    # 通过检测这两个特征字符，可以快速判断整个提示词是否存在编码问题
+    #
+    # 【何时触发默认提示词】
+    # 1. 自定义提示词包含编码错误（检测到"浣犳槸"或"銆"）
+    # 2. normalize_quality_gate_system_prompt() 返回空（提示词完全无效）
+    # 3. 环境变量 LLM_QUALITY_GATE_SYSTEM_PROMPT 未设置或为空
+    #
+    # 触发后会使用 QUALITY_GATE_SYSTEM_PROMPT_DEFAULT 作为备用，确保 LLM 能正确理解评分标准
+    system_prompt = normalize_quality_gate_system_prompt(system_prompt) or QUALITY_GATE_SYSTEM_PROMPT_DEFAULT
+    if "浣犳槸" in system_prompt or "銆" in system_prompt:
+        system_prompt = QUALITY_GATE_SYSTEM_PROMPT_DEFAULT
 
     # ========== 第二步：创建 LLM 客户端 ==========
     try:

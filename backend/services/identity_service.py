@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import Cookie, Header, HTTPException
+from fastapi import Cookie, HTTPException
 
 from core.db.identity import (
     SESSION_COOKIE_NAME,
@@ -28,107 +28,162 @@ from core.db.identity import (
     anonymous_identity,
     latest_identity_snapshot_synced_at,
     resolve_auth_session,
-    resolve_identity_snapshot,
 )
 from core.db.query_logs import AuditLogRecord, append_audit_log
 from core.runtime_settings import resolve_runtime_setting
 
 
-def is_legacy_header_auth_enabled() -> bool:
-    """
-    检查是否启用旧版请求头认证
-
-    旧版认证方式用于本地开发调试，生产环境应禁用。
-
-    返回：
-        bool: 是否启用旧版认证
-
-    说明：
-        - 通过 KB_LEGACY_HEADER_AUTH_ENABLED 配置控制
-        - 默认启用（便于本地开发）
-        - 生产环境建议禁用
-    """
-    """Keep local bootstrap compatibility unless production explicitly disables it."""
-    try:
-        return bool(resolve_runtime_setting("KB_LEGACY_HEADER_AUTH_ENABLED")[0])
-    except Exception:
-        return True
-
-
 def get_current_identity(
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
-    tenant_id: str | None = Header(default=None, alias="X-KB-Tenant-Id"),
-    user_id: str | None = Header(default=None, alias="X-KB-User-Id"),
 ) -> IdentityContext:
     """
-    获取当前请求的用户身份
+    从 KB 会话 Cookie 解析当前请求的用户身份。
 
-    这是身份认证的核心函数，按优先级解析身份：
-    1. 如果有 session_token，从会话中解析身份
-    2. 如果没有会话但有请求头，从请求头解析身份
-    3. 如果都没有，返回匿名身份
+    ========================================
+    为什么移除旧版请求头认证？
+    ========================================
 
-    参数：
-        session_token: Cookie 中的会话令牌
-        tenant_id: 请求头中的租户 ID
-        user_id: 请求头中的用户 ID
+    旧版支持通过 X-KB-Tenant-Id 和 X-KB-User-Id 请求头传递身份，
+    这种方式存在以下安全风险：
 
-    返回：
-        IdentityContext: 用户身份上下文对象
+    1. 【信任边界模糊】请求头可被客户端任意伪造，攻击者可冒充任意用户
+    2. 【缺乏签名验证】无法验证请求头来源是否为可信的 AI 基座
+    3. 【绕过会话管理】无法追踪会话状态、检测过期或强制登出
 
-    异常：
-        HTTPException(401): 会话无效或过期
-        HTTPException(403): 身份快照不允许此用户
+    新版仅接受通过 AI 基座 SSO 流程颁发的正式 session_token：
+    - 会话由 AI 基座统一管理，有完整的生命周期
+    - Token 通过安全 Cookie 传递，避免客户端篡改
+    - 支持会话过期检测和刷新机制
 
-    使用示例：
-        @router.get("/me")
-        def get_me(identity: IdentityContext = Depends(get_current_identity)):
-            return {"user_id": identity.user_id}
+    ========================================
+    新的身份解析流程
+    ========================================
+
+    1. 【提取 Cookie】从请求中读取 SESSION_COOKIE_NAME 对应的会话令牌
+    2. 【解析会话】调用 resolve_auth_session() 验证令牌有效性
+       - 有效：返回 IdentityContext（包含租户、用户、角色、权限）
+       - 无效/过期：返回 None
+    3. 【审计失败】如果会话无效，记录审计日志并抛出 401 错误
+    4. 【匿名身份】如果无 Cookie，返回匿名用户身份
+
+    Args:
+        session_token: 从 Cookie 中提取的会话令牌，由 AI 基座 SSO 颁发
+
+    Returns:
+        IdentityContext: 已认证用户的身份上下文，或匿名用户身份
+
+    Raises:
+        HTTPException: 会话无效或过期时返回 401 Unauthorized
     """
-    """Resolve request identity from the KB session or the legacy bootstrap headers."""
     if session_token:
         identity = resolve_auth_session(session_token)
         if identity is None:
+            # 会话无效，记录审计日志并拒绝访问
+            # 这有助于检测潜在的会话劫持或过期令牌重放攻击
+            audit_access_denied(
+                anonymous_identity(),
+                action="identity.resolve",
+                resource_type="auth_session",
+                reason_code="KB_SESSION_INVALID",
+                risk_level="medium",
+                metadata={"authMethod": "kb_session"},
+            )
             raise HTTPException(status_code=401, detail="KB session is invalid or expired")
         return identity
+    # 无 Cookie，返回匿名身份（未登录用户）
+    return anonymous_identity()
 
-    tenant = (tenant_id or "").strip()
-    user = (user_id or "").strip()
-    if not tenant and not user:
-        return anonymous_identity()
-    if not is_legacy_header_auth_enabled():
-        raise HTTPException(status_code=401, detail="Legacy X-KB-* header authentication is disabled")
-    if not tenant or not user:
-        raise HTTPException(status_code=401, detail="Both X-KB-Tenant-Id and X-KB-User-Id are required")
 
-    identity = resolve_identity_snapshot(tenant, user)
-    if identity is None:
-        raise HTTPException(status_code=403, detail="AI base identity snapshot did not allow this user")
-    return identity
+def audit_access_denied(
+    identity: IdentityContext | None,
+    *,
+    action: str,
+    resource_type: str,
+    reason_code: str,
+    resource_id: str | None = None,
+    kb_id: str | None = None,
+    risk_level: str = "medium",
+    metadata: dict | None = None,
+) -> None:
+    """
+    记录访问被拒绝事件到审计日志。
+
+    ========================================
+    审计日志的核心作用
+    ========================================
+
+    1. 【安全监控】
+       - 检测异常访问模式（如暴力破解、会话劫持尝试）
+       - 识别潜在的账户被盗或权限滥用行为
+       - 支持安全事件的事后追溯和分析
+
+    2. 【合规要求】
+       - 满足企业安全审计要求（如 ISO 27001、SOC 2）
+       - 提供可追溯的访问拒绝证据链
+       - 支持数据保护法规（如 GDPR）的合规证明
+
+    3. 【运维价值】
+       - 帮助发现配置错误或权限设计问题
+       - 统计高频拒绝原因，指导系统改进
+       - 支持故障排查（用户投诉"无法访问"时的根因分析）
+
+    4. 【风险分级】
+       - risk_level 参数允许标记事件严重程度：
+         - "low": 预期内的权限不足（如普通用户访问管理功能）
+         - "medium": 可能存在安全问题（如无效会话）
+         - "high": 高风险事件（如身份快照过期、可疑的访问尝试）
+
+    ========================================
+    使用场景示例
+    ========================================
+
+    1. 会话验证失败 → reason_code="KB_SESSION_INVALID"
+    2. 身份快照过期 → reason_code="IDENTITY_SNAPSHOT_STALE"
+    3. 权限检查失败 → reason_code="PERMISSION_DENIED"
+    4. 资源不存在拒绝 → reason_code="RESOURCE_NOT_FOUND"
+
+    Args:
+        identity: 被拒绝的身份上下文（可能为匿名或已认证用户）
+        action: 尝试执行的操作（如 "identity.resolve", "kb.delete"）
+        resource_type: 资源类型（如 "auth_session", "knowledge_base"）
+        reason_code: 拒绝原因代码，用于分类统计和报警
+        resource_id: 可选，具体资源 ID
+        kb_id: 可选，知识库 ID
+        risk_level: 风险等级，默认 "medium"
+        metadata: 额外的上下文信息，用于详细分析
+
+    Note:
+        审计日志写入失败不应影响主流程，因此内部捕获所有异常静默处理
+    """
+    details = {
+        "reasonCode": reason_code,
+        "action": action,
+        "resourceType": resource_type,
+        "resourceId": resource_id,
+        "kbId": kb_id,
+    }
+    if metadata:
+        details.update(metadata)
+    try:
+        append_audit_log(
+            AuditLogRecord(
+                action="access.denied",
+                resource_type=resource_type,
+                resource_id=resource_id,
+                kb_id=kb_id,
+                identity=identity,
+                outcome="denied",
+                risk_level=risk_level,
+                summary=f"Rejected {action}: {reason_code}",
+                metadata=details,
+            )
+        )
+    except Exception:
+        # 审计日志写入失败不应阻塞主流程，静默忽略
+        pass
 
 
 def identity_snapshot_freshness(identity: IdentityContext) -> dict:
-    """
-    检查身份快照的新鲜度
-
-    身份快照需要定期更新，此函数检查快照是否过期。
-
-    参数：
-        identity: 身份上下文对象
-
-    返回：
-        dict: 新鲜度信息：
-            - enforced: 是否强制检查新鲜度
-            - fresh: 快照是否新鲜（未过期）
-            - reasonCode: 状态码（空/IDENTITY_SNAPSHOT_MISSING/IDENTITY_SNAPSHOT_STALE）
-            - syncedAt: 上次同步时间
-            - ageSeconds: 快照年龄（秒）
-            - maxAgeSeconds: 最大允许年龄（秒）
-
-    说明：
-        - 只有 AI 基座 SSO 身份才强制检查
-        - 其他身份（匿名、本地开发）不检查
-    """
     """Return freshness metadata for formal AI Base SSO identities."""
     max_age_seconds = _identity_snapshot_max_age_seconds()
     if not _requires_fresh_snapshot(identity):
@@ -171,30 +226,6 @@ def assert_fresh_identity_snapshot(
     resource_id: str | None = None,
     kb_id: str | None = None,
 ) -> None:
-    """
-    断言身份快照是新鲜的
-
-    在执行敏感操作前，检查身份快照是否过期。
-    如果过期，拒绝操作并记录审计日志。
-
-    参数：
-        identity: 身份上下文对象
-        action: 操作名称（如 "create_document"）
-        resource_type: 资源类型（如 "document"）
-        resource_id: 资源 ID（可选）
-        kb_id: 知识库 ID（可选）
-
-    异常：
-        HTTPException(403): 身份快照过期
-
-    使用示例：
-        assert_fresh_identity_snapshot(
-            identity,
-            action="delete_document",
-            resource_type="document",
-            resource_id="doc-123"
-        )
-    """
     freshness = identity_snapshot_freshness(identity)
     if freshness["fresh"]:
         return
@@ -211,18 +242,20 @@ def assert_fresh_identity_snapshot(
         "resourceId": resource_id,
         "kbId": kb_id,
     }
-    append_audit_log(
-        AuditLogRecord(
-            action="access.denied",
-            resource_type=resource_type,
-            resource_id=resource_id,
-            kb_id=kb_id,
-            identity=identity,
-            outcome="denied",
-            risk_level="high",
-            summary=f"Rejected {action} because AI Base identity snapshot is stale",
-            metadata=metadata,
-        )
+    audit_access_denied(
+        identity,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        kb_id=kb_id,
+        reason_code=reason_code,
+        risk_level="high",
+        metadata={
+            "identitySnapshotStale": True,
+            "syncedAt": freshness["syncedAt"],
+            "ageSeconds": freshness["ageSeconds"],
+            "maxAgeSeconds": freshness["maxAgeSeconds"],
+        },
     )
     raise HTTPException(
         status_code=403,
@@ -235,29 +268,10 @@ def assert_fresh_identity_snapshot(
 
 
 def _requires_fresh_snapshot(identity: IdentityContext) -> bool:
-    """
-    检查身份是否需要新鲜度检查
-
-    只有 AI 基座 SSO 身份且启用访问控制时才需要检查。
-
-    参数：
-        identity: 身份上下文对象
-
-    返回：
-        bool: 是否需要检查新鲜度
-    """
     return identity.enforce_access and str(identity.source or "").startswith("ai_base_sso_")
 
 
 def _identity_snapshot_max_age_seconds() -> int:
-    """
-    获取身份快照最大允许年龄
-
-    从配置中读取，默认 600 秒（10 分钟）。
-
-    返回：
-        int: 最大允许年龄（秒）
-    """
     try:
         value = int(resolve_runtime_setting("KB_IDENTITY_SNAPSHOT_MAX_AGE_SECONDS")[0])
     except Exception:

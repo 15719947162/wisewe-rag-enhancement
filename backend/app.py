@@ -108,15 +108,17 @@ from core.runtime_settings import apply_runtime_env_overrides
 
 # 默认允许的 HTTP 头列表
 _DEFAULT_CORS_HEADERS = [
-    "Accept",                    # 客户端可以接受的内容类型
-    "Accept-Language",           # 客户端语言偏好
-    "Authorization",             # 认证 token（用于 API Key 认证）
-    "Content-Language",          # 内容语言
-    "Content-Type",              # 请求体的内容类型（JSON、表单等）
-    "X-API-Key",                 # 自定义 API Key 头（项目特定）
-    "X-KB-Tenant-Id",            # 租户 ID（多租户系统）
-    "X-KB-User-Id",              # 用户 ID（用户身份识别）
-    "X-Requested-With",          # AJAX 请求标识
+    "Accept",
+    "Accept-Language",
+    "Authorization",
+    "Content-Language",
+    "Content-Type",
+    "X-API-Key",
+    "X-KB-Timestamp",
+    "X-KB-Nonce",
+    "X-KB-Body-SHA256",
+    "X-KB-Signature",
+    "X-Requested-With",
 ]
 
 

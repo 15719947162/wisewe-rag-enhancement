@@ -35,6 +35,7 @@ from urllib.parse import urlencode
 
 import httpx
 
+from core.db.external_system_configs import get_active_external_system_config
 from core.db.identity import (
     DEFAULT_SESSION_TTL_SECONDS,
     IdentityContext,
@@ -115,36 +116,146 @@ class SsoConfig:
 
 def load_sso_config() -> SsoConfig:
     """
-    从环境变量和运行时配置加载 SSO 配置
+    从外部系统配置和环境变量加载 SSO 配置
 
-    配置来源优先级：
-    1. 运行时配置（数据库覆盖）
-    2. 环境变量
-    3. 默认值
+    ============================================================
+    配置加载流程
+    ============================================================
 
-    返回：
-        SsoConfig 实例
+    1. 首先加载通用配置：
+       - console_base_url: 前端控制台地址（仅从环境变量）
+       - session_ttl_seconds: 会话有效期（仅从环境变量）
 
-    示例环境变量：
+    2. 然后尝试加载外部系统配置：
+       - 调用 _load_active_external_sso_config() 获取数据库中的活动配置
+       - 如果存在外部配置，优先使用外部配置构建 SsoConfig
+
+    3. 如果没有外部配置，则回退到环境变量：
+       - 从环境变量读取基础配置
+       - 从运行时设置读取路径模板配置
+
+    ============================================================
+    配置优先级（从高到低）
+    ============================================================
+
+    优先级 1: 外部系统配置（数据库）
+        - 存储在 external_system_configs 表中
+        - 通过管理后台或 API 动态配置
+        - 字段：ssoBaseUrl, ssoClientId, ssoClientSecret, ssoRedirectUri 等
+
+    优先级 2: 环境变量
+        - AI_BASE_SSO_BASE_URL: AI 基座地址
+        - AI_BASE_SSO_CLIENT_ID: 客户端 ID
+        - AI_BASE_SSO_CLIENT_SECRET: 客户端密钥
+        - AI_BASE_SSO_REDIRECT_URI: 回调地址
+
+    优先级 3: 运行时设置（runtime_settings 表）
+        - AI_BASE_SSO_LAUNCH_BASE_URL: 登录页基础地址
+        - AI_BASE_SSO_LAUNCH_PATH: 登录页路径
+        - AI_BASE_SSO_EXCHANGE_PATH: 凭证交换接口路径
+        - AI_BASE_SSO_USER_SNAPSHOT_PATH_TEMPLATE: 用户快照路径模板
+        - AI_BASE_SSO_DELTA_PATH: 增量同步路径
+
+    优先级 4: 默认值
+        - launch_path: "/sso"
+        - exchange_path: "/ai/system/internal/sso/exchange"
+        - user_snapshot_path_template: "/ai/system/internal/identity/snapshot/users/{userId}"
+        - delta_path: "/ai/system/internal/identity/snapshot/delta"
+
+    ============================================================
+    使用示例
+    ============================================================
+
+    示例 1：仅使用环境变量配置
+        # .env 文件
         AI_BASE_SSO_BASE_URL=https://ai.example.com
         AI_BASE_SSO_CLIENT_ID=rag-client
-        AI_BASE_SSO_CLIENT_SECRET=xxx
+        AI_BASE_SSO_CLIENT_SECRET=your-secret
         AI_BASE_SSO_REDIRECT_URI=https://rag.example.com/sso/callback
+
+        # Python 代码
+        config = load_sso_config()
+        # config.base_url == "https://ai.example.com"
+
+    示例 2：外部配置覆盖环境变量
+        # 数据库中存在活动的外部配置
+        # ssoBaseUrl = "https://ai-prod.example.com"
+        # ssoClientId = "prod-client"
+
+        # 环境变量设置
+        # AI_BASE_SSO_BASE_URL=https://ai-dev.example.com
+
+        config = load_sso_config()
+        # config.base_url == "https://ai-prod.example.com"  # 外部配置优先
+
+    示例 3：混合配置（部分外部，部分环境变量）
+        # 外部配置仅设置核心字段
+        # ssoBaseUrl, ssoClientId, ssoClientSecret, ssoRedirectUri
+
+        # 环境变量设置其他字段
+        # KB_CONSOLE_BASE_URL=https://console.example.com
+        # KB_SESSION_TTL_SECONDS=86400
+
+        config = load_sso_config()
+        # config.base_url 来自外部配置
+        # config.console_base_url 来自环境变量
+
+    ============================================================
+    错误处理
+    ============================================================
+
+    - 外部配置加载失败时，自动回退到环境变量，不影响服务可用性
+    - 加载失败会记录 DEBUG 级别日志，便于排查问题
+    - 最终通过 is_sso_configured() 验证配置完整性
+
+    返回：
+        SsoConfig: 包含所有 SSO 配置的不可变数据对象
     """
+    console_base_url = (os.getenv("KB_CONSOLE_BASE_URL") or "").strip().rstrip("/")
+    ttl = int(os.getenv("KB_SESSION_TTL_SECONDS") or DEFAULT_SESSION_TTL_SECONDS)
+    active_config = _load_active_external_sso_config()
+    if active_config:
+        return SsoConfig(
+            base_url=str(active_config.get("ssoBaseUrl") or "").strip().rstrip("/"),
+            client_id=str(active_config.get("ssoClientId") or "").strip(),
+            client_secret=str(active_config.get("ssoClientSecret") or "").strip(),
+            redirect_uri=str(active_config.get("ssoRedirectUri") or "").strip(),
+            console_base_url=console_base_url,
+            launch_base_url=str(active_config.get("ssoLaunchBaseUrl") or "").strip().rstrip("/"),
+            launch_path=_normalize_sso_path(active_config.get("ssoLaunchPath"), "/sso"),
+            exchange_path=_normalize_sso_path(
+                active_config.get("ssoExchangePath"),
+                "/ai/system/internal/sso/exchange",
+            ),
+            user_snapshot_path_template=_normalize_sso_path(
+                active_config.get("ssoUserSnapshotPathTemplate"),
+                "/ai/system/internal/identity/snapshot/users/{userId}",
+            ),
+            delta_path=_normalize_sso_path(
+                active_config.get("ssoDeltaPath"),
+                "/ai/system/internal/identity/snapshot/delta",
+            ),
+            session_ttl_seconds=ttl,
+        )
+
     base_url = (os.getenv("AI_BASE_SSO_BASE_URL") or "").strip().rstrip("/")
     client_id = (os.getenv("AI_BASE_SSO_CLIENT_ID") or "rag-client").strip()
     client_secret = (os.getenv("AI_BASE_SSO_CLIENT_SECRET") or "").strip()
     redirect_uri = (os.getenv("AI_BASE_SSO_REDIRECT_URI") or "").strip()
-    console_base_url = (os.getenv("KB_CONSOLE_BASE_URL") or "").strip().rstrip("/")
     launch_base_url = str(resolve_runtime_setting("AI_BASE_SSO_LAUNCH_BASE_URL")[0] or "").strip().rstrip("/")
-    launch_path = str(resolve_runtime_setting("AI_BASE_SSO_LAUNCH_PATH")[0] or "/sso").strip()
-    exchange_path = str(resolve_runtime_setting("AI_BASE_SSO_EXCHANGE_PATH")[0] or "/ai/system/internal/sso/exchange").strip()
-    user_snapshot_path_template = str(
-        resolve_runtime_setting("AI_BASE_SSO_USER_SNAPSHOT_PATH_TEMPLATE")[0]
-        or "/ai/system/internal/identity/snapshot/users/{userId}"
-    ).strip()
-    delta_path = str(resolve_runtime_setting("AI_BASE_SSO_DELTA_PATH")[0] or "/ai/system/internal/identity/snapshot/delta").strip()
-    ttl = int(os.getenv("KB_SESSION_TTL_SECONDS") or DEFAULT_SESSION_TTL_SECONDS)
+    launch_path = _normalize_sso_path(resolve_runtime_setting("AI_BASE_SSO_LAUNCH_PATH")[0], "/sso")
+    exchange_path = _normalize_sso_path(
+        resolve_runtime_setting("AI_BASE_SSO_EXCHANGE_PATH")[0],
+        "/ai/system/internal/sso/exchange",
+    )
+    user_snapshot_path_template = _normalize_sso_path(
+        resolve_runtime_setting("AI_BASE_SSO_USER_SNAPSHOT_PATH_TEMPLATE")[0],
+        "/ai/system/internal/identity/snapshot/users/{userId}",
+    )
+    delta_path = _normalize_sso_path(
+        resolve_runtime_setting("AI_BASE_SSO_DELTA_PATH")[0],
+        "/ai/system/internal/identity/snapshot/delta",
+    )
     return SsoConfig(
         base_url=base_url,
         client_id=client_id,
@@ -158,6 +269,131 @@ def load_sso_config() -> SsoConfig:
         delta_path=delta_path,
         session_ttl_seconds=ttl,
     )
+
+
+def _load_active_external_sso_config() -> dict[str, Any] | None:
+    """
+    加载活动的外部系统 SSO 配置
+
+    ============================================================
+    功能说明
+    ============================================================
+
+    从数据库中查询当前活动的外部系统配置。这是配置加载的第一优先级，
+    允许运维人员在不重启服务的情况下动态修改 SSO 配置。
+
+    ============================================================
+    加载流程
+    ============================================================
+
+    1. 调用 get_active_external_system_config() 查询数据库
+    2. 查询条件：system_type = 'ai_base_sso' AND is_active = True
+    3. 返回配置字典，包含以下字段（如果存在）：
+       - ssoBaseUrl: AI 基座地址
+       - ssoClientId: 客户端 ID
+       - ssoClientSecret: 客户端密钥
+       - ssoRedirectUri: 回调地址
+       - ssoLaunchBaseUrl: 登录页基础地址
+       - ssoLaunchPath: 登录页路径
+       - ssoExchangePath: 凭证交换接口路径
+       - ssoUserSnapshotPathTemplate: 用户快照路径模板
+       - ssoDeltaPath: 增量同步路径
+
+    ============================================================
+    错误处理
+    ============================================================
+
+    - 数据库连接失败时返回 None，回退到环境变量
+    - 无活动配置时返回 None
+    - 记录 DEBUG 级别日志，便于排查
+
+    ============================================================
+    使用示例
+    ============================================================
+
+    示例 1：正常加载
+        config = _load_active_external_sso_config()
+        if config:
+            base_url = config.get("ssoBaseUrl")  # "https://ai.example.com"
+            client_id = config.get("ssoClientId")  # "rag-client"
+
+    示例 2：配置不存在
+        config = _load_active_external_sso_config()
+        # config is None，load_sso_config() 会使用环境变量
+
+    示例 3：数据库异常
+        # 数据库连接失败
+        config = _load_active_external_sso_config()
+        # config is None，日志记录异常信息
+
+    返回：
+        dict[str, Any] | None: 外部配置字典，不存在或加载失败时返回 None
+    """
+    try:
+        return get_active_external_system_config()
+    except Exception as exc:
+        logger.debug("Failed to load active external SSO config; falling back to runtime settings: %s", exc)
+        return None
+
+
+def _normalize_sso_path(value: Any, default: str) -> str:
+    """
+    规范化 SSO API 路径
+
+    ============================================================
+    功能说明
+    ============================================================
+
+    确保路径字符串以 "/" 开头，符合 URL path 规范。
+    用于处理外部配置或环境变量中的路径配置。
+
+    ============================================================
+    处理规则
+    ============================================================
+
+    1. 空值处理：如果输入为空或 None，使用默认值
+    2. 格式规范化：确保路径以 "/" 开头
+    3. 空白清理：去除首尾空白字符
+
+    ============================================================
+    使用示例
+    ============================================================
+
+    示例 1：正常路径
+        path = _normalize_sso_path("/sso", "/login")
+        # 返回: "/sso"
+
+    示例 2：缺少前导斜杠
+        path = _normalize_sso_path("sso", "/login")
+        # 返回: "/sso"
+
+    示例 3：空值使用默认值
+        path = _normalize_sso_path(None, "/login")
+        # 返回: "/login"
+
+        path = _normalize_sso_path("", "/login")
+        # 返回: "/login"
+
+    示例 4：带空白字符
+        path = _normalize_sso_path("  /sso  ", "/login")
+        # 返回: "/sso"
+
+    示例 5：在 load_sso_config() 中的应用
+        # 外部配置可能返回各种格式的路径
+        launch_path = _normalize_sso_path(
+            active_config.get("ssoLaunchPath"),  # 可能是 "sso", "/sso", None 等
+            "/sso"  # 默认值
+        )
+
+    参数：
+        value: 原始路径值，可以是任意类型（会转为字符串）
+        default: 默认路径，当 value 为空时使用
+
+    返回：
+        str: 规范化后的路径，保证以 "/" 开头
+    """
+    text = str(value or "").strip() or default
+    return text if text.startswith("/") else f"/{text}"
 
 
 def is_sso_configured(config: SsoConfig | None = None) -> bool:

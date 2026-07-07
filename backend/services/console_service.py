@@ -28,7 +28,8 @@ from pathlib import Path
 
 from backend.services.evaluation_store import load_evaluations
 from backend.services.access_control import filter_tasks_by_identity
-from backend.services.ingestion_service import get_all_tasks
+from backend.services.ingestion_service import delete_ingestion_task, get_all_tasks, mark_ingestion_task_failed
+from backend.services.task_store import get_task_store_diagnostics
 from backend.services.kb_service import get_documents_payload, get_knowledge_bases_payload
 from core.config import load_config
 from core.db.api_keys import (
@@ -42,14 +43,29 @@ from core.db.api_keys import (
     update_api_key,
     update_openapi_app,
 )
-from core.db.identity import IdentityContext
+from core.db.external_system_configs import (
+    create_external_system_config,
+    delete_external_system_config,
+    list_external_system_configs,
+    update_external_system_config,
+)
+from core.db.identity import TENANT_ADMIN_ROLE_CODE, IdentityContext
 from core.db.identity import list_identity_sync_runs
-from core.db.query_logs import AuditLogRecord, append_audit_log, fetch_audit_logs, fetch_rag_query_logs, fetch_token_usage_summary_for_identity
+from core.db.query_logs import (
+    AuditLogRecord,
+    append_audit_log,
+    fetch_app_usage_report_for_identity,
+    fetch_audit_logs,
+    fetch_rag_query_logs,
+    fetch_token_usage_summary_for_identity,
+)
 from core.db.query_logs import export_rag_query_logs_csv
 from core.db.connection import is_db_available
 from core.runtime_settings import (
     RUNTIME_SETTING_SPECS,
+    list_runtime_setting_versions,
     resolve_runtime_setting,
+    rollback_runtime_settings,
     save_runtime_overrides,
     stringify_runtime_value,
 )
@@ -589,6 +605,91 @@ def update_console_settings_with_audit(
     return result
 
 
+def get_console_setting_versions(limit: int = 20) -> list[dict]:
+    """
+    获取系统设置的版本历史列表
+
+    返回运行时配置的历史版本记录，用于支持配置回滚和审计追踪。
+    每个版本记录包含版本 ID、创建时间、创建者、修改的配置项数量等元信息。
+
+    参数：
+        limit: 返回版本数量限制，默认为 20 条。用于控制返回数据量，
+              避免版本历史过长时的性能问题。
+
+    返回：
+        list[dict]: 版本历史列表，每个版本记录包含：
+            - version_id: 版本唯一标识
+            - created_at: 版本创建时间（ISO 格式）
+            - created_by: 创建者标识（console / user_id）
+            - key_count: 该版本修改的配置项数量
+            - snapshot: 该版本的配置快照（可选）
+
+    使用场景：
+        1. 控制台配置历史页面展示，让管理员查看配置变更轨迹
+        2. 配置回滚前的版本选择，帮助管理员确认回滚目标
+        3. 审计追踪，配合审计日志定位配置变更责任人
+    """
+    return list_runtime_setting_versions(limit=limit)
+
+
+def rollback_console_settings_version(
+    version_id: str,
+    *,
+    identity: IdentityContext | None = None,
+    updated_by: str = "console",
+) -> dict[str, object]:
+    """
+    回滚系统配置到指定历史版本
+
+    将运行时配置恢复到历史版本状态，用于配置错误恢复或撤销变更。
+    执行回滚后会自动记录高风控级别的审计日志。
+
+    参数：
+        version_id: 目标版本 ID，从 get_console_setting_versions() 获取。
+                   必须是有效的历史版本 ID，否则返回 not_found 状态。
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                  回滚操作通常需要租户管理员或平台管理员权限。
+        updated_by: 更新来源标识，默认为 "console"。
+                   可用于区分不同来源的回滚操作（如 console / api / scheduled）。
+
+    返回：
+        dict: 回滚结果，包含：
+            - rolledBack: bool - 是否成功回滚
+            - versionId: str - 回滚到的版本 ID
+            - updated: list[str] - 被修改的配置项键名列表
+            - count: int - 被修改的配置项数量
+
+    使用场景：
+        1. 配置变更导致系统异常时的快速恢复
+        2. 批量配置修改后需要撤销的场景
+        3. 测试环境配置重置为已知良好状态
+
+    注意事项：
+        - 回滚是高风险操作，会覆盖当前所有运行时配置
+        - 建议在回滚前先创建当前版本的快照
+        - 回滚后可能需要重启服务才能生效（取决于配置项的 effective_mode）
+    """
+    result = rollback_runtime_settings(version_id, updated_by=updated_by)
+    append_audit_log(
+        AuditLogRecord(
+            action="settings.rollback",
+            resource_type="settings",
+            resource_id=version_id,
+            identity=identity,
+            outcome="success" if result.get("rolledBack") else "not_found",
+            risk_level="high" if result.get("rolledBack") else "medium",
+            summary=f"Rolled back runtime settings to version {version_id}",
+            metadata={
+                "versionId": version_id,
+                "rolledBack": bool(result.get("rolledBack")),
+                "updatedKeys": list(result.get("updated") or []),
+                "updatedCount": int(result.get("count") or 0),
+            },
+        )
+    )
+    return result
+
+
 def get_console_alerts() -> list[dict]:
     """
     获取系统告警列表
@@ -856,6 +957,7 @@ def get_console_identity_sync_logs(limit: int = 100, identity: IdentityContext |
 def get_console_ingestion_tasks(
     *,
     keyword: str | None = None,
+    task_id: str | None = None,
     status: str | None = None,
     strategy: str | None = None,
     page: int = 1,
@@ -865,11 +967,14 @@ def get_console_ingestion_tasks(
     kb_items = get_knowledge_bases_payload(identity)
     kb_by_id = {str(item["id"]): item for item in kb_items}
     normalized_keyword = (keyword or "").strip().lower()
+    normalized_task_id = (task_id or "").strip().lower()
     tasks = [
         _ingestion_task_row(task, kb_by_id.get(str(task.get("kb_id") or "")))
         for task in filter_tasks_by_identity(get_all_tasks(), identity or IdentityContext())
     ]
 
+    if normalized_task_id:
+        tasks = [task for task in tasks if normalized_task_id in str(task["id"]).lower()]
     if status:
         tasks = [task for task in tasks if task["status"] == status]
     if strategy:
@@ -880,9 +985,12 @@ def get_console_ingestion_tasks(
             for task in tasks
             if normalized_keyword in " ".join(
                 [
+                    task["id"],
                     task["kbName"],
                     task["kbId"],
                     task["documentName"],
+                    task.get("sourceType", ""),
+                    task.get("sourceSummary", ""),
                 ]
             ).lower()
         ]
@@ -937,6 +1045,364 @@ def get_latest_ingestion_log(
     }
 
 
+TASK_QUEUE_ACTIVE_STATUSES = {"pending", "running", "awaiting_confirmation"}
+TASK_QUEUE_STALE_SECONDS = 2 * 60 * 60
+
+
+def get_console_task_queue(identity: IdentityContext | None = None) -> dict:
+    """
+    获取任务队列的完整状态视图
+
+    返回所有入库任务的队列状态，包括任务统计摘要、健康状态判断和详细任务列表。
+    用于任务队列治理和监控场景。
+
+    参数：
+        identity: 用户身份上下文，用于权限过滤。非管理员只能看到
+                 自己有权限访问的知识库关联的任务。
+
+    返回：
+        dict: 任务队列状态，包含：
+            - store: dict - 任务存储诊断信息
+                - type: 存储类型（memory / postgres）
+                - total: 总任务数
+                - path: 存储路径（仅文件存储）
+            - summary: dict - 任务统计摘要
+                - total: 总任务数
+                - active: 活跃任务数（pending + running + awaiting_confirmation）
+                - pending: 待处理任务数
+                - running: 运行中任务数
+                - awaitingConfirmation: 等待确认任务数
+                - failed: 失败任务数
+                - success: 成功任务数
+                - stale: 僵尸任务数（长时间未更新的活跃任务）
+            - staleThresholdSeconds: int - 判定僵尸任务的时间阈值（秒）
+            - items: list[dict] - 任务详细列表，每个任务包含：
+                - id / taskId: 任务 ID
+                - kbId / kbName: 知识库信息
+                - documentName: 文档名称
+                - status: 任务状态
+                - health: 健康状态（normal / stale / waiting / failed / done）
+                - riskReason: 风险原因说明
+                - ageSeconds: 任务创建至今的秒数
+                - idleSeconds: 任务最后更新至今的秒数
+                - canMarkFailed: 是否可以标记为失败
+                - canDelete: 是否可以删除
+                - canForceDelete: 是否可以强制删除
+
+    使用场景：
+        1. 任务队列治理页面，展示所有任务状态和健康度
+        2. 运维监控告警，识别僵尸任务和异常任务
+        3. 任务清理决策，基于健康状态和空闲时间判断清理策略
+        4. 容量规划，统计各状态任务数量趋势
+
+    注意事项：
+        - stale 状态判定基于 TASK_QUEUE_STALE_SECONDS 常量（默认 2 小时）
+        - awaiting_confirmation 状态的任务需要人工审核切片草稿
+        - force delete 会中断正在运行的任务，应谨慎使用
+    """
+    kb_items = get_knowledge_bases_payload(identity)
+    kb_by_id = {str(item["id"]): item for item in kb_items}
+    raw_tasks = filter_tasks_by_identity(get_all_tasks(), identity or IdentityContext())
+    rows = [_task_queue_row(task, kb_by_id.get(str(task.get("kb_id") or ""))) for task in raw_tasks]
+
+    summary = {
+        "total": len(rows),
+        "active": len([row for row in rows if row["status"] in TASK_QUEUE_ACTIVE_STATUSES]),
+        "pending": len([row for row in rows if row["status"] == "pending"]),
+        "running": len([row for row in rows if row["status"] == "running"]),
+        "awaitingConfirmation": len([row for row in rows if row["status"] == "awaiting_confirmation"]),
+        "failed": len([row for row in rows if row["status"] == "failed"]),
+        "success": len([row for row in rows if row["status"] == "success"]),
+        "stale": len([row for row in rows if row["health"] == "stale"]),
+    }
+    return {
+        "store": get_task_store_diagnostics(),
+        "summary": summary,
+        "staleThresholdSeconds": TASK_QUEUE_STALE_SECONDS,
+        "items": rows,
+    }
+
+
+def mark_console_task_failed(task_id: str, *, reason: str = "", identity: IdentityContext | None = None) -> dict:
+    """
+    将活跃任务标记为失败状态
+
+    用于任务队列治理场景，管理员可以手动将长时间未响应或异常的任务
+    标记为失败，避免任务卡在 pending/running 状态阻塞队列。
+    操作会记录高风控级别的审计日志。
+
+    参数：
+        task_id: 任务 ID，必须是有效的入库任务 ID。
+                仅允许标记处于 pending、running 或 awaiting_confirmation 状态的任务。
+        reason: 标记失败的原因说明，用于记录到任务 error 字段和审计日志。
+               如果不提供，默认使用 "管理员在任务队列治理中标记为失败"。
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                 需要租户管理员或平台管理员权限。
+
+    返回：
+        dict: 更新后的任务队列行数据，包含：
+            - id: 任务 ID
+            - status: "failed"（已更新）
+            - health: "failed"
+            - error: 失败原因（reason 或默认消息）
+            - riskReason: "任务失败"
+            - 其他任务队列行字段（见 get_console_task_queue）
+
+    异常：
+        ValueError: 任务不存在时抛出
+
+    使用场景：
+        1. 僵尸任务治理：长时间未更新的 pending/running 任务，
+           确认 worker 已停止后手动标记失败释放队列资源
+        2. 异常任务处理：解析服务异常导致任务无法继续时，
+           管理员手动标记失败避免无限等待
+        3. 测试调试：测试环境清理异常任务
+
+    注意事项：
+        - 标记失败是高风控操作，应确认任务确实无法继续执行
+        - 标记失败后任务状态不可逆，只能删除或重新入库
+        - 操作会触发审计日志记录，便于事后追溯
+    """
+    task = mark_ingestion_task_failed(
+        task_id,
+        reason=reason or "管理员在任务队列治理中标记为失败",
+        failed_by=_actor_id(identity),
+    )
+    if task is None:
+        raise ValueError(f"Task '{task_id}' not found")
+    append_audit_log(
+        AuditLogRecord(
+            action="task_queue.mark_failed",
+            resource_type="ingestion_task",
+            resource_id=task_id,
+            kb_id=str(task.get("kb_id") or "") or None,
+            identity=identity,
+            outcome="success",
+            risk_level="high",
+            summary=f"Marked ingestion task {task_id} as failed",
+            metadata={"reason": reason or "", "status": task.get("status"), "currentStage": task.get("current_stage")},
+        )
+    )
+    return _task_queue_row(task)
+
+
+def delete_console_task(task_id: str, *, force: bool = False, identity: IdentityContext | None = None) -> dict:
+    """
+    删除入库任务记录及相关资源
+
+    从任务存储中删除任务记录，可选是否强制删除正在运行的任务。
+    操作会根据是否强制删除记录相应风控级别的审计日志。
+
+    参数：
+        task_id: 任务 ID，必须是有效的入库任务 ID。
+        force: 是否强制删除。默认为 False。
+               - False: 仅允许删除已完成（success/failed）或等待确认的任务
+               - True: 允许删除正在运行（pending/running）的任务，
+                       会中断正在执行的 worker 进程
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                 需要租户管理员或平台管理员权限。
+
+    返回：
+        dict: 删除结果，包含：
+            - removed: dict - 被删除的资源清单
+                - taskId: 任务 ID
+                - task: 任务记录
+                - logs: 日志文件路径（如存在）
+                - chunks: 切片数据（如已生成且配置清理）
+            - 其他 delete_ingestion_task 返回的字段
+
+    异常：
+        ValueError: 任务不存在时抛出
+        RuntimeError: force=False 且任务状态不允许删除时抛出（由底层函数抛出）
+
+    使用场景：
+        1. 任务清理：删除已完成的历史任务，释放存储空间
+        2. 异常任务移除：删除失败的任务记录，清理错误状态
+        3. 强制中断：force=True 时中断正在运行的异常任务
+        4. 测试环境清理：批量删除测试任务
+
+    注意事项：
+        - force=True 是高风险操作，可能中断正在执行的 worker
+        - 删除操作不可逆，任务数据将永久丢失
+        - 建议在删除前确认任务状态和重要性
+        - 操作会触发审计日志，force=True 时风险级别为 high
+    """
+    result = delete_ingestion_task(task_id, force=force)
+    if result is None:
+        raise ValueError(f"Task '{task_id}' not found")
+    append_audit_log(
+        AuditLogRecord(
+            action="task_queue.delete",
+            resource_type="ingestion_task",
+            resource_id=task_id,
+            identity=identity,
+            outcome="success",
+            risk_level="high" if force else "medium",
+            summary=f"Deleted ingestion task {task_id}",
+            metadata={"force": force, "removed": result.get("removed", {})},
+        )
+    )
+    return result
+
+
+def cleanup_console_tasks(
+    *,
+    statuses: list[str],
+    older_than_seconds: int,
+    include_stale_active: bool = False,
+    identity: IdentityContext | None = None,
+) -> dict:
+    """
+    批量清理符合条件的入库任务
+
+    根据任务状态和创建时间批量删除任务记录，用于任务队列的定期清理和治理。
+    支持清理长时间未更新的活跃任务（僵尸任务）。
+
+    参数：
+        statuses: 需要清理的任务状态列表。支持的状态包括：
+                 - "success": 成功任务
+                 - "failed": 失败任务
+                 - "degraded": 降级任务
+                 - "empty": 空结果任务
+                 - "pending": 待处理任务（需配合 include_stale_active）
+                 - "running": 运行中任务（需配合 include_stale_active）
+                 - "awaiting_confirmation": 等待确认任务
+                 至少需要提供一个有效状态。
+        older_than_seconds: 任务年龄阈值（秒）。仅删除创建时间早于此阈值的任务。
+                           例如：7200 表示只删除创建时间超过 2 小时的任务。
+                           设置为 0 表示不限制年龄。
+        include_stale_active: 是否包含长时间未更新的活跃任务（僵尸任务）。
+                            - False: 即使指定了 pending/running 状态也不会删除
+                            - True: 会使用 force=True 删除符合条件的 pending/running 任务
+                            建议与 large older_than_seconds 配合使用，避免误删新任务。
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                 需要租户管理员或平台管理员权限。
+
+    返回：
+        dict: 清理结果，包含：
+            - deleted: list[str] - 成功删除的任务 ID 列表
+            - deletedCount: int - 成功删除的任务数量
+            - skipped: list[dict] - 跳过的任务列表，每项包含：
+                - taskId: 任务 ID
+                - reason: 跳过原因（通常是删除失败的具体错误）
+            - skippedCount: int - 跳过的任务数量
+
+    异常：
+        ValueError: statuses 为空或不包含有效状态时抛出
+
+    使用场景：
+        1. 定期清理：每日定时清理超过 7 天的成功/失败任务
+           cleanup_console_tasks(statuses=["success", "failed"], older_than_seconds=7*24*3600)
+        2. 僵尸任务治理：清理超过 4 小时未更新的活跃任务
+           cleanup_console_tasks(statuses=["pending", "running"], older_than_seconds=4*3600, include_stale_active=True)
+        3. 等待确认任务清理：清理长期未处理的草稿确认
+           cleanup_console_tasks(statuses=["awaiting_confirmation"], older_than_seconds=24*3600)
+
+    注意事项：
+        - include_stale_active=True 是高风险操作，可能中断正在运行的正常任务
+        - 建议在业务低峰期执行批量清理
+        - 清理操作不可逆，任务数据将永久丢失
+        - 操作会触发审计日志，风险级别根据 include_stale_active 决定
+    """
+    allowed_statuses = {"success", "failed", "degraded", "empty", "pending", "running", "awaiting_confirmation"}
+    normalized_statuses = [status for status in statuses if status in allowed_statuses]
+    if not normalized_statuses:
+        raise ValueError("At least one valid status is required")
+
+    cutoff_age = max(0, int(older_than_seconds or 0))
+    deleted: list[str] = []
+    skipped: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for task in get_all_tasks():
+        task_id = str(task.get("id") or "")
+        status = str(task.get("status") or "pending")
+        if status not in normalized_statuses:
+            continue
+        age_seconds = _seconds_since(task.get("updated_at") or task.get("created_at"), now)
+        if age_seconds < cutoff_age:
+            continue
+        force = bool(include_stale_active and status in TASK_QUEUE_ACTIVE_STATUSES)
+        try:
+            result = delete_ingestion_task(task_id, force=force)
+            if result:
+                deleted.append(task_id)
+        except RuntimeError as exc:
+            skipped.append({"taskId": task_id, "reason": str(exc)})
+
+    append_audit_log(
+        AuditLogRecord(
+            action="task_queue.cleanup",
+            resource_type="ingestion_task",
+            identity=identity,
+            outcome="success",
+            risk_level="high" if include_stale_active else "medium",
+            summary=f"Cleaned up {len(deleted)} ingestion tasks",
+            metadata={
+                "statuses": normalized_statuses,
+                "olderThanSeconds": cutoff_age,
+                "includeStaleActive": include_stale_active,
+                "deleted": deleted,
+                "skipped": skipped,
+            },
+        )
+    )
+    return {"deleted": deleted, "deletedCount": len(deleted), "skipped": skipped, "skippedCount": len(skipped)}
+
+
+def _task_queue_row(task: dict, kb: dict | None = None) -> dict:
+    """构建任务队列行"""
+    row = _ingestion_task_row(task, kb)
+    now = datetime.now(timezone.utc)
+    age_seconds = _seconds_since(row.get("createdAt"), now)
+    idle_seconds = _seconds_since(row.get("updatedAt") or row.get("createdAt"), now)
+    status = str(row.get("status") or "pending")
+    health = "normal"
+    risk_reason = ""
+    if status in {"pending", "running"} and idle_seconds >= TASK_QUEUE_STALE_SECONDS:
+        health = "stale"
+        risk_reason = "任务长时间未更新，可能需要人工确认 worker 状态"
+    elif status == "awaiting_confirmation":
+        health = "waiting"
+        risk_reason = "等待人工确认切片草稿"
+    elif status == "failed":
+        health = "failed"
+        risk_reason = row.get("error") or "任务失败"
+    elif status == "success":
+        health = "done"
+    return {
+        **row,
+        "ageSeconds": age_seconds,
+        "idleSeconds": idle_seconds,
+        "health": health,
+        "riskReason": risk_reason,
+        "canMarkFailed": status in TASK_QUEUE_ACTIVE_STATUSES,
+        "canDelete": status not in {"pending", "running"} or bool(task.get("done")),
+        "canForceDelete": status in {"pending", "running"} and not bool(task.get("done")),
+    }
+
+
+def _seconds_since(value: object, now: datetime | None = None) -> int:
+    """计算时间差（秒）"""
+    if not value:
+        return 0
+    text = str(value)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0, int((current - parsed).total_seconds()))
+
+
+def _actor_id(identity: IdentityContext | None) -> str:
+    """获取操作者 ID"""
+    if identity and identity.enforce_access:
+        return str(identity.user_id or "console")
+    return "console"
+
+
 def get_console_token_usage(
     limit: int = 10,
     identity: IdentityContext | None = None,
@@ -947,6 +1413,86 @@ def get_console_token_usage(
         tenant_id=identity.tenant_id if identity and identity.enforce_access else None,
         include_all_tenants=bool(identity and identity.is_platform_admin),
         pipeline_domain=pipeline_domain,
+    )
+
+
+def get_console_app_usage(
+    *,
+    limit: int = 20,
+    identity: IdentityContext | None = None,
+    app_id: str | None = None,
+    api_key_id: str | None = None,
+    kb_id: str | None = None,
+    pipeline_domain: str | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> dict:
+    """
+    获取 OpenAPI 应用的使用统计报告
+
+    返回指定应用或 API Key 的调用统计，用于用量监控、配额管理和计费分析。
+    支持按应用、API Key、知识库、时间范围等多维度筛选。
+
+    参数：
+        limit: 返回结果数量限制，默认为 20。用于控制返回数据量。
+        identity: 用户身份上下文，用于权限校验和数据范围过滤。
+                 需要租户管理员或平台管理员权限。
+                 非管理员只能查看自己租户的数据，平台管理员可查看所有租户。
+        app_id: OpenAPI 应用 ID。指定后仅返回该应用的统计数据。
+        api_key_id: API Key ID。指定后仅返回该 API Key 的统计数据。
+        kb_id: 知识库 ID。指定后仅返回该知识库相关的调用统计。
+        pipeline_domain: 管道域。用于区分不同业务场景的调用，如：
+                        - "rag": RAG 问答
+                        - "embedding": 向量化服务
+                        - "chunking": 切片服务
+        start_at: 统计开始时间（ISO 格式 datetime）。用于时间范围筛选。
+        end_at: 统计结束时间（ISO 格式 datetime）。用于时间范围筛选。
+
+    返回：
+        dict: 应用使用统计，包含：
+            - items: list[dict] - 使用统计列表，每项包含：
+                - appId: 应用 ID
+                - appName: 应用名称
+                - apiKeyId: API Key ID
+                - apiKeyName: API Key 名称
+                - kbId: 知识库 ID
+                - kbName: 知识库名称
+                - requestCount: 请求总数
+                - tokenCount: Token 消耗总数
+                - avgLatencyMs: 平均延迟（毫秒）
+                - errorCount: 错误请求数
+                - successRate: 成功率
+                - firstRequestAt: 首次请求时间
+                - lastRequestAt: 最后请求时间
+            - summary: dict - 汇总统计
+                - totalRequests: 总请求数
+                - totalTokens: 总 Token 数
+                - avgSuccessRate: 平均成功率
+            - filters: dict - 当前应用的筛选条件快照
+
+    使用场景：
+        1. 用量监控：查看各应用的 API 调用量和 Token 消耗趋势
+        2. 配额管理：判断是否接近 API Key 或应用的配额限制
+        3. 计费分析：按应用或租户统计 Token 消耗，支持成本分摊
+        4. 性能诊断：识别高延迟或高错误率的应用
+        5. 安全审计：监控异常调用模式，如短时间内大量请求
+
+    注意事项：
+        - 需要 API Key 管理权限才能访问
+        - 时间范围查询建议不超过 30 天，避免性能问题
+        - 统计数据基于 query_logs 表聚合，可能有几分钟延迟
+    """
+    _assert_api_key_manager(identity)
+    return fetch_app_usage_report_for_identity(
+        limit=limit,
+        tenant_id=identity.tenant_id if identity and identity.enforce_access else None,
+        include_all_tenants=bool(identity and identity.is_platform_admin),
+        app_id=app_id,
+        api_key_id=api_key_id,
+        kb_id=kb_id,
+        pipeline_domain=pipeline_domain,
+        start_at=start_at,
+        end_at=end_at,
     )
 
 
@@ -1208,6 +1754,324 @@ def _assert_api_key_manager(identity: IdentityContext | None) -> None:
         raise PermissionError("Only tenant or platform administrators can manage API Keys")
 
 
+def get_console_external_system_configs(identity: IdentityContext | None = None) -> list[dict]:
+    """
+    获取外部系统配置列表
+
+    返回所有外部系统配置记录，主要用于 SSO 集成和身份认证场景。
+    外部系统配置用于对接 AI 基座或其他统一身份认证平台。
+
+    参数：
+        identity: 用户身份上下文，用于权限校验和数据范围过滤。
+                 需要平台管理员或租户管理员权限。
+                 非管理员无法访问此接口。
+
+    返回：
+        list[dict]: 外部系统配置列表，每个配置包含：
+            - id: 配置 ID
+            - ssoBaseUrl: SSO 服务基础 URL
+            - ssoClientId: SSO 客户端 ID
+            - ssoClientSecret: SSO 客户端密钥（已脱敏，显示 ****xxxx）
+            - ssoRedirectUri: SSO 回调地址
+            - ssoLaunchBaseUrl: SSO 启动基础 URL
+            - ssoLaunchPath: SSO 启动路径
+            - ssoExchangePath: Token 交换路径
+            - ssoUserSnapshotPathTemplate: 用户快照路径模板
+            - ssoDeltaPath: 增量同步路径
+            - status: 配置状态（active / disabled）
+            - createdAt: 创建时间
+            - updatedAt: 更新时间
+            - createdBy: 创建者
+
+    使用场景：
+        1. SSO 配置管理：查看和配置 AI 基座 SSO 接入参数
+        2. 多租户配置：为不同租户配置不同的 SSO 接入点
+        3. 身份同步：配置用户快照和增量同步接口路径
+        4. 配置审计：查看当前生效的外部系统配置
+
+    注意事项：
+        - ssoClientSecret 是敏感字段，返回时已脱敏
+        - 只有平台管理员或租户管理员可以访问
+        - 通常一个租户只有一个活跃的外部系统配置
+        - 配置变更后可能需要重启服务或清理缓存才能生效
+    """
+    _assert_external_system_config_manager(identity)
+    return list_external_system_configs(identity)
+
+
+def create_console_external_system_config(payload: dict, identity: IdentityContext | None = None) -> dict:
+    """
+    创建外部系统配置
+
+    创建新的外部系统配置记录，用于 SSO 集成和身份认证对接。
+    配置创建后会自动记录高风控级别的审计日志。
+
+    参数：
+        payload: 配置数据字典，包含：
+            - ssoBaseUrl: str（必填）- SSO 服务基础 URL，如 "https://sso.example.com"
+            - ssoClientId: str（必填）- SSO 客户端 ID，从 SSO 平台获取
+            - ssoClientSecret: str（必填）- SSO 客户端密钥，从 SSO 平台获取
+            - ssoRedirectUri: str（必填）- SSO 回调地址，需要与 SSO 平台注册的一致
+            - ssoLaunchBaseUrl: str（可选）- SSO 启动基础 URL，用于生成跳转链接
+            - ssoLaunchPath: str（必填，默认 "/sso"）- SSO 启动路径
+            - ssoExchangePath: str（必填，默认 "/ai/system/internal/sso/exchange"）-
+                              Token 交换接口路径
+            - ssoUserSnapshotPathTemplate: str（必填，默认
+                "/ai/system/internal/identity/snapshot/users/{userId}"）-
+                用户快照接口路径模板，支持 {userId} 占位符
+            - ssoDeltaPath: str（必填，默认
+                "/ai/system/internal/identity/snapshot/delta"）-
+                增量同步接口路径
+            - status: str（可选，默认 "active"）- 配置状态，可选 active / disabled
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                 需要平台管理员或租户管理员权限。
+
+    返回：
+        dict: 创建的配置记录，包含配置 ID 和所有字段（secret 已脱敏）。
+
+    异常：
+        ValueError: 必填字段缺失或格式错误时抛出
+        PermissionError: 权限不足时抛出
+
+    使用场景：
+        1. 首次 SSO 接入：创建 AI 基座 SSO 配置，启用单点登录
+        2. 多环境配置：为测试环境和生产环境创建不同的 SSO 配置
+        3. 租户隔离：为不同租户配置独立的 SSO 接入点
+
+    注意事项：
+        - 创建前需确认 SSO 平台已注册相应的 Client ID
+        - ssoRedirectUri 必须与 SSO 平台注册的回调地址完全一致
+        - 密钥在数据库中加密存储，返回时已脱敏
+        - 创建操作会触发审计日志记录
+    """
+    _assert_external_system_config_manager(identity)
+    result = create_external_system_config(
+        sso_base_url=_required_external_config_text(payload.get("ssoBaseUrl"), "ssoBaseUrl"),
+        sso_client_id=_required_external_config_text(payload.get("ssoClientId"), "ssoClientId"),
+        sso_client_secret=_required_external_config_text(payload.get("ssoClientSecret"), "ssoClientSecret"),
+        sso_redirect_uri=_required_external_config_text(payload.get("ssoRedirectUri"), "ssoRedirectUri"),
+        sso_launch_base_url=str(payload.get("ssoLaunchBaseUrl") or "").strip(),
+        sso_launch_path=_required_external_config_text(payload.get("ssoLaunchPath") or "/sso", "ssoLaunchPath"),
+        sso_exchange_path=_required_external_config_text(
+            payload.get("ssoExchangePath") or "/ai/system/internal/sso/exchange",
+            "ssoExchangePath",
+        ),
+        sso_user_snapshot_path_template=_required_external_config_text(
+            payload.get("ssoUserSnapshotPathTemplate") or "/ai/system/internal/identity/snapshot/users/{userId}",
+            "ssoUserSnapshotPathTemplate",
+        ),
+        sso_delta_path=_required_external_config_text(
+            payload.get("ssoDeltaPath") or "/ai/system/internal/identity/snapshot/delta",
+            "ssoDeltaPath",
+        ),
+        status=str(payload.get("status") or "active"),
+        identity=identity,
+    )
+    append_audit_log(
+        AuditLogRecord(
+            action="external_system_config.create",
+            resource_type="external_system_config",
+            resource_id=result.get("id"),
+            identity=identity,
+            outcome="success",
+            risk_level="high",
+            summary=f"Created external system config {result.get('id')}",
+            metadata={
+                "ssoBaseUrl": result.get("ssoBaseUrl"),
+                "ssoClientId": result.get("ssoClientId"),
+                "ssoRedirectUri": result.get("ssoRedirectUri"),
+                "ssoLaunchBaseUrl": result.get("ssoLaunchBaseUrl"),
+                "ssoLaunchPath": result.get("ssoLaunchPath"),
+                "ssoExchangePath": result.get("ssoExchangePath"),
+                "ssoUserSnapshotPathTemplate": result.get("ssoUserSnapshotPathTemplate"),
+                "ssoDeltaPath": result.get("ssoDeltaPath"),
+                "status": result.get("status"),
+                "secretProvided": bool(payload.get("ssoClientSecret")),
+            },
+        )
+    )
+    return result
+
+
+def update_console_external_system_config(config_id: str, payload: dict, identity: IdentityContext | None = None) -> dict | None:
+    """
+    更新外部系统配置
+
+    更新指定的外部系统配置记录，支持部分字段更新。
+    配置更新后会自动记录相应风控级别的审计日志。
+
+    参数：
+        config_id: 配置 ID，必须是有效的外部系统配置 ID。
+        payload: 更新数据字典，支持的字段（均为可选）：
+            - ssoBaseUrl: str - SSO 服务基础 URL
+            - ssoClientId: str - SSO 客户端 ID
+            - ssoClientSecret: str - SSO 客户端密钥（暂不支持通过此接口更新）
+            - ssoRedirectUri: str - SSO 回调地址
+            - ssoLaunchBaseUrl: str - SSO 启动基础 URL
+            - ssoLaunchPath: str - SSO 启动路径
+            - ssoExchangePath: str - Token 交换接口路径
+            - ssoUserSnapshotPathTemplate: str - 用户快照接口路径模板
+            - ssoDeltaPath: str - 增量同步接口路径
+            - status: str - 配置状态（active / disabled）
+            注意：payload 中不包含的字段不会被更新。
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                 需要平台管理员或租户管理员权限。
+
+    返回：
+        dict | None: 更新后的配置记录（secret 已脱敏），如果配置不存在返回 None。
+
+    异常：
+        ValueError: 字段值格式错误时抛出（如必填字段传空值）
+        PermissionError: 权限不足时抛出
+
+    使用场景：
+        1. SSO 配置调整：更新 SSO 服务地址或回调地址
+        2. 配置禁用：将 status 设为 disabled，临时禁用 SSO 接入
+        3. 路径定制：调整身份同步接口的路径模板
+        4. 环境迁移：切换到新的 SSO 服务实例
+
+    注意事项：
+        - ssoClientSecret 暂不支持通过此接口更新，需使用专门的密钥轮转接口
+        - 更新 ssoRedirectUri 后需同步更新 SSO 平台的注册信息
+        - 禁用配置（status=disabled）会中断 SSO 登录，应提前通知用户
+        - 更新操作会触发审计日志，禁用配置时风险级别为 high
+    """
+    _assert_external_system_config_manager(identity)
+    sso_base_url = (
+        _required_external_config_text(payload.get("ssoBaseUrl"), "ssoBaseUrl")
+        if "ssoBaseUrl" in payload
+        else None
+    )
+    sso_client_id = (
+        _required_external_config_text(payload.get("ssoClientId"), "ssoClientId")
+        if "ssoClientId" in payload
+        else None
+    )
+    sso_redirect_uri = (
+        _required_external_config_text(payload.get("ssoRedirectUri"), "ssoRedirectUri")
+        if "ssoRedirectUri" in payload
+        else None
+    )
+    sso_launch_base_url = str(payload.get("ssoLaunchBaseUrl") or "").strip() if "ssoLaunchBaseUrl" in payload else None
+    sso_launch_path = (
+        _required_external_config_text(payload.get("ssoLaunchPath"), "ssoLaunchPath")
+        if "ssoLaunchPath" in payload
+        else None
+    )
+    sso_exchange_path = (
+        _required_external_config_text(payload.get("ssoExchangePath"), "ssoExchangePath")
+        if "ssoExchangePath" in payload
+        else None
+    )
+    sso_user_snapshot_path_template = (
+        _required_external_config_text(payload.get("ssoUserSnapshotPathTemplate"), "ssoUserSnapshotPathTemplate")
+        if "ssoUserSnapshotPathTemplate" in payload
+        else None
+    )
+    sso_delta_path = (
+        _required_external_config_text(payload.get("ssoDeltaPath"), "ssoDeltaPath")
+        if "ssoDeltaPath" in payload
+        else None
+    )
+    status = str(payload.get("status")) if "status" in payload else None
+
+    result = update_external_system_config(
+        config_id,
+        sso_base_url=sso_base_url,
+        sso_client_id=sso_client_id,
+        sso_redirect_uri=sso_redirect_uri,
+        sso_launch_base_url=sso_launch_base_url,
+        sso_launch_path=sso_launch_path,
+        sso_exchange_path=sso_exchange_path,
+        sso_user_snapshot_path_template=sso_user_snapshot_path_template,
+        sso_delta_path=sso_delta_path,
+        status=status,
+        identity=identity,
+    )
+    if result:
+        changed_fields = [field for field in payload.keys() if field != "ssoClientSecret"]
+        append_audit_log(
+            AuditLogRecord(
+                action="external_system_config.update",
+                resource_type="external_system_config",
+                resource_id=config_id,
+                identity=identity,
+                outcome="success",
+                risk_level="high" if payload.get("status") == "disabled" else "medium",
+                summary=f"Updated external system config {config_id}",
+                metadata={
+                    "changedFields": sorted(changed_fields),
+                    "secretUpdated": False,
+                },
+            )
+        )
+    return result
+
+
+def delete_console_external_system_config(config_id: str, identity: IdentityContext | None = None) -> bool:
+    """
+    删除外部系统配置
+
+    删除指定的外部系统配置记录。删除后配置将永久不可恢复。
+    操作会自动记录高风控级别的审计日志。
+
+    参数：
+        config_id: 配置 ID，必须是有效的外部系统配置 ID。
+        identity: 用户身份上下文，用于权限校验和审计日志记录。
+                 需要平台管理员或租户管理员权限。
+
+    返回：
+        bool: 是否成功删除。True 表示已删除，False 表示配置不存在。
+
+    异常：
+        PermissionError: 权限不足时抛出
+
+    使用场景：
+        1. 配置清理：删除测试环境的无效配置
+        2. SSO 服务更换：删除旧 SSO 平台的配置，创建新配置
+        3. 租户注销：删除租户的 SSO 配置，停止身份认证服务
+
+    注意事项：
+        - 删除操作不可逆，配置数据将永久丢失
+        - 删除活跃配置（status=active）会导致 SSO 登录失败
+        - 建议删除前先将配置设为 disabled，观察一段时间确认无影响后再删除
+        - 删除操作会触发高风控级别的审计日志
+        - 如果该配置正在被使用（有活跃的 SSO session），删除可能导致用户登录异常
+    """
+    _assert_external_system_config_manager(identity)
+    deleted = delete_external_system_config(config_id, identity)
+    if deleted:
+        append_audit_log(
+            AuditLogRecord(
+                action="external_system_config.delete",
+                resource_type="external_system_config",
+                resource_id=config_id,
+                identity=identity,
+                outcome="success",
+                risk_level="high",
+                summary=f"Deleted external system config {config_id}",
+            )
+        )
+    return deleted
+
+
+def _required_external_config_text(value: object, field_name: str) -> str:
+    """验证必填文本字段"""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
+
+
+def _assert_external_system_config_manager(identity: IdentityContext | None) -> None:
+    """验证外部系统配置管理权限"""
+    if identity and identity.enforce_access:
+        if identity.is_platform_admin or TENANT_ADMIN_ROLE_CODE in {str(role) for role in identity.role_codes}:
+            return
+        raise PermissionError("Only super administrators can manage external system configurations")
+    raise PermissionError("Only super administrators can manage external system configurations")
+
+
 def _ingestion_task_row(task: dict, kb: dict | None = None) -> dict:
     stages = list((task.get("stages") or {}).values())
     stage_payload = []
@@ -1234,6 +2098,7 @@ def _ingestion_task_row(task: dict, kb: dict | None = None) -> dict:
     actor_id = str(task.get("actor_id") or task.get("created_by") or "")
     return {
         "id": task.get("id", ""),
+        "taskId": task.get("id", ""),
         "kbId": kb_id,
         "kbName": (kb or {}).get("name") or kb_id,
         "documentName": task.get("filename", ""),
@@ -1244,6 +2109,10 @@ def _ingestion_task_row(task: dict, kb: dict | None = None) -> dict:
         "actorId": actor_id,
         "actorName": actor_id or "未记录",
         "parseMethod": task.get("parse_provider") or task.get("parse_method") or "mineru",
+        "sourceType": task.get("source_type", "file"),
+        "sourceSummary": task.get("source_summary", task.get("filename", "")),
+        "fastImport": bool(task.get("fast_import")),
+        "skippedStages": task.get("skipped_stages", []) if isinstance(task.get("skipped_stages"), list) else [],
         "chunkCount": int(task.get("chunk_count", 0) or 0),
         "totalLatencyMs": total_latency_ms,
         "currentStage": task.get("current_stage") or "",

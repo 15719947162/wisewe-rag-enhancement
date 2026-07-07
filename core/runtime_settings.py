@@ -54,6 +54,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -77,6 +78,18 @@ SettingScope = Literal["env", "config"]
 
 # 设置值类型：用于类型转换和验证
 SettingValueType = Literal["str", "bool", "int", "float"]
+
+# UAT 测试标记正则表达式：用于识别 UAT 测试专用的系统提示词
+# 格式：[UAT-XXXXXXXX]，其中 X 是十六进制字符（至少 8 位）
+_UAT_MARKER_RE = re.compile(r"^\s*\[UAT-[0-9a-fA-F]{8,}\]\s*$")
+
+# 质量门控系统提示词的默认值
+# 当数据库覆盖或环境变量为空字符串时，回退到此默认值
+QUALITY_GATE_SYSTEM_PROMPT_DEFAULT = (
+    "你是教材切片质量审核助手。请判断切片是否包含可用于问答的有效知识；"
+    "表格、图片、公式、图注和题目即使文字较短，也应视为可能有效。"
+    "只过滤乱码、空内容和明显解析噪声。"
+)
 
 # ============================================================================
 # 数据模型
@@ -1242,6 +1255,126 @@ def _write_nested(config: dict[str, Any], path: tuple[str, ...], value: Any) -> 
 
 
 # ============================================================================
+# 值规范化工具
+# ============================================================================
+
+def normalize_quality_gate_system_prompt(value: Any) -> str:
+    """
+    规范化质量门控系统提示词
+
+    处理特殊的 UAT 测试标记。如果提示词是 UAT 测试标记格式
+    （如 [UAT-12345678]），则返回空字符串，触发回退到默认值。
+
+    为什么需要此函数
+    ----------------
+    在 UAT（用户验收测试）场景中，需要验证质量门控逻辑是否正确使用默认值。
+    通过设置特殊的 UAT 标记作为系统提示词，可以模拟用户清除数据库覆盖的情况，
+    从而测试默认值回退机制。此函数识别并处理这些特殊标记，确保测试流程顺畅。
+
+    参数
+    ----
+    value : Any
+        原始提示词值，可能是字符串、None 或其他类型
+
+    返回
+    ----
+    str
+        规范化后的提示词：
+        - 如果是 UAT 标记格式，返回空字符串（触发默认值回退）
+        - 否则返回原始值（去除前后空白）
+
+    UAT 标记格式
+    ------------
+    正则表达式：[UAT-XXXXXXXX]，其中 X 为十六进制字符（至少 8 位）
+    例如：[UAT-12345678]、[UAT-ABCDEF00]、[UAT-0123456789AB]
+
+    示例
+    ----
+    >>> # UAT 测试标记会被转换为空字符串
+    >>> normalize_quality_gate_system_prompt("[UAT-12345678]")
+    ""
+    >>> normalize_quality_gate_system_prompt("  [UAT-ABCDEF00]  ")
+    ""
+    >>> # 正常的提示词保持不变
+    >>> normalize_quality_gate_system_prompt("正常的提示词")
+    "正常的提示词"
+    >>> # None 和空值返回空字符串
+    >>> normalize_quality_gate_system_prompt(None)
+    ""
+
+    注意
+    ----
+    此函数仅用于 LLM_QUALITY_GATE_SYSTEM_PROMPT 设置的规范化，
+    其他设置不需要此特殊处理。
+    """
+    prompt = str(value or "").strip()
+    if _UAT_MARKER_RE.match(prompt):
+        return ""
+    return prompt
+
+
+def _normalize_runtime_override(key: str, value: Any) -> Any:
+    """
+    规范化运行时覆盖值
+
+    对特定设置键应用自定义规范化逻辑。
+    这是一个分发函数，根据设置键选择合适的规范化处理器。
+
+    为什么需要此函数
+    ----------------
+    不同设置可能有不同的规范化需求。例如：
+    - LLM_QUALITY_GATE_SYSTEM_PROMPT 需要处理 UAT 测试标记
+    - 某些设置可能需要去除前后空白
+    - 未来可能添加更多自定义规范化规则
+
+    通过此分发函数，可以将规范化逻辑集中管理，避免在多个地方重复代码。
+
+    参数
+    ----
+    key : str
+        设置键名，必须是 RUNTIME_SETTING_SPECS 中注册的键
+
+    value : Any
+        原始值，可能是字符串、None 或其他类型
+
+    返回
+    ----
+    Any
+        规范化后的值，类型取决于具体设置的规范化规则
+
+    规范化规则
+    ----------
+    当前实现的规范化规则：
+    - LLM_QUALITY_GATE_SYSTEM_PROMPT: 调用 normalize_quality_gate_system_prompt()
+    - 其他设置: 原样返回
+
+    示例
+    ----
+    >>> # 特殊设置会应用自定义规范化
+    >>> _normalize_runtime_override("LLM_QUALITY_GATE_SYSTEM_PROMPT", "[UAT-12345678]")
+    ""
+    >>> _normalize_runtime_override("LLM_QUALITY_GATE_SYSTEM_PROMPT", "正常提示词")
+    "正常提示词"
+    >>> # 普通设置原样返回
+    >>> _normalize_runtime_override("LLM_EMBEDDING_MODEL", "text-embedding-v3")
+    "text-embedding-v3"
+
+    扩展性
+    ------
+    如需为新设置添加规范化规则，可在此函数中添加条件分支：
+    >>> if key == "NEW_SETTING_KEY":
+    ...     return custom_normalize_function(value)
+
+    注意
+    ----
+    此函数是内部函数（以 _ 开头），不应在模块外部直接调用。
+    """
+    if key == "LLM_QUALITY_GATE_SYSTEM_PROMPT":
+        return normalize_quality_gate_system_prompt(value)
+    return value
+
+
+# ============================================================================
 # 数据库访问层
 # ============================================================================
 
@@ -1297,6 +1430,199 @@ def _load_overrides_from_db() -> dict[str, Any]:
         for key, value in rows
         if str(key) in RUNTIME_SETTING_SPECS
     }
+
+
+def _read_console_settings(cur: Any) -> dict[str, Any]:
+    """
+    从数据库读取所有控制台设置
+
+    辅助函数，用于获取当前所有设置的快照，用于版本追踪和回滚操作。
+
+    为什么需要此函数
+    ----------------
+    在实现设置版本控制时，需要记录每次变更前后的完整设置快照：
+    - save_runtime_overrides() 在保存前后的快照用于版本记录
+    - rollback_runtime_settings() 需要比较回滚前后的差异
+    - 审计日志需要完整的设置状态
+
+    此函数提供统一的快照读取接口，确保数据格式一致。
+
+    参数
+    ----
+    cur : Any
+        数据库游标对象，必须是已打开的游标
+        游标应该在事务中，确保读取的一致性
+
+    返回
+    ----
+    dict[str, Any]
+        设置键值对字典：
+        - 键：设置名称（字符串）
+        - 值：设置的 JSON 值（任意 JSON 兼容类型）
+        - 按 key 排序（便于比较和调试）
+
+    过滤逻辑
+    --------
+    只返回在 RUNTIME_SETTING_SPECS 中注册的设置。
+    未注册的设置会被忽略，避免引入无效配置。
+
+    示例
+    ----
+    >>> # 在事务中读取当前设置
+    >>> conn = get_db_connection()
+    >>> with conn.cursor() as cur:
+    ...     settings = _read_console_settings(cur)
+    ...     print(f"当前有 {len(settings)} 个设置")
+    ...
+    >>> # 典型返回值
+    >>> settings
+    {
+        "LLM_EMBEDDING_MODEL": "text-embedding-v3",
+        "LLM_EMBEDDING_BATCH_SIZE": 20,
+        "parser.cloud.timeout": 1800
+    }
+
+    数据库查询
+    ----------
+    执行 SQL: SELECT key, value FROM console_settings ORDER BY key
+
+    注意
+    ----
+    - 此函数是内部函数（以 _ 开头），不应在模块外部直接调用
+    - 调用者负责事务管理和游标生命周期
+    - 返回值不应被修改（如需修改请深拷贝）
+    """
+    cur.execute("SELECT key, value FROM console_settings ORDER BY key")
+    rows = cur.fetchall()
+    return {
+        str(key): value
+        for key, value in rows
+        if str(key) in RUNTIME_SETTING_SPECS
+    }
+
+
+def _create_settings_version(
+    cur: Any,
+    *,
+    action: str,
+    snapshot: dict[str, Any],
+    changed_keys: list[str],
+    created_by: str,
+    source_version_id: str | None = None,
+) -> str | None:
+    """
+    创建设置版本记录
+
+    将当前的设置变更记录到版本历史表中，支持回滚和审计功能。
+
+    为什么需要此函数
+    ----------------
+    设置版本控制是企业级配置管理的核心需求：
+    - **审计追踪**: 记录谁在什么时候修改了哪些设置
+    - **回滚能力**: 当配置错误时，可以快速恢复到历史版本
+    - **变更对比**: 比较不同时间点的配置差异
+    - **合规要求**: 满足安全审计和变更管理的合规要求
+
+    此函数在每次设置变更时被调用，创建不可变的版本记录。
+
+    参数
+    ----
+    cur : Any
+        数据库游标对象，必须在事务中
+
+    action : str
+        操作类型，常见值：
+        - "update": 更新设置
+        - "rollback": 回滚设置
+
+    snapshot : dict[str, Any]
+        操作后的设置快照，包含所有设置的完整状态
+
+    changed_keys : list[str]
+        被修改的设置键列表，用于快速识别变更范围
+
+    created_by : str
+        操作者标识，用于审计追踪：
+        - 用户名（如 "admin"）
+        - 系统标识（如 "console"）
+        - API 标识（如 "api-key-123"）
+
+    source_version_id : str | None
+        源版本 ID，用于回滚操作追踪
+        - 回滚操作时记录目标版本的 ID
+        - 普通更新时为 None
+
+    返回
+    ----
+    str | None
+        新创建的版本 ID（UUID 字符串），如果失败则返回 None
+
+    数据库表结构
+    ------------
+    console_settings_versions 表：
+    - id: UUID PRIMARY KEY（自动生成）
+    - action: TEXT（操作类型）
+    - settings_snapshot: JSONB（完整设置快照）
+    - changed_keys: JSONB（变更的键列表）
+    - source_version_id: TEXT（源版本 ID）
+    - created_by: TEXT（操作者）
+    - created_at: TIMESTAMP（创建时间，自动生成）
+
+    示例
+    ----
+    >>> # 在事务中创建版本记录
+    >>> conn = get_db_connection()
+    >>> with conn.cursor() as cur:
+    ...     snapshot = {"LLM_EMBEDDING_MODEL": "text-embedding-v3"}
+    ...     version_id = _create_settings_version(
+    ...         cur,
+    ...         action="update",
+    ...         snapshot=snapshot,
+    ...         changed_keys=["LLM_EMBEDDING_MODEL"],
+    ...         created_by="admin"
+    ...     )
+    ...     print(f"创建版本: {version_id}")
+    ...
+    >>> # 回滚操作记录
+    >>> version_id = _create_settings_version(
+    ...     cur,
+    ...     action="rollback",
+    ...     snapshot=target_snapshot,
+    ...     changed_keys=["LLM_EMBEDDING_MODEL", "LLM_EMBEDDING_BATCH_SIZE"],
+    ...     created_by="admin",
+    ...     source_version_id="previous-version-uuid"
+    ... )
+
+    SQL 语句
+    --------
+    INSERT INTO console_settings_versions(
+        action, settings_snapshot, changed_keys, source_version_id, created_by
+    ) VALUES(%s, %s::jsonb, %s::jsonb, %s, %s)
+    RETURNING id
+
+    注意
+    ----
+    - 此函数是内部函数（以 _ 开头），不应在模块外部直接调用
+    - 调用者负责事务管理和错误处理
+    - 返回的版本 ID 可用于后续的回滚操作
+    - snapshot 和 changed_keys 会被序列化为 JSONB 存储
+    """
+    cur.execute(
+        """
+        INSERT INTO console_settings_versions(action, settings_snapshot, changed_keys, source_version_id, created_by)
+        VALUES(%s, %s::jsonb, %s::jsonb, %s, %s)
+        RETURNING id
+        """,
+        (
+            action,
+            json.dumps(snapshot, ensure_ascii=False),
+            json.dumps(changed_keys, ensure_ascii=False),
+            source_version_id,
+            created_by,
+        ),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else None
 
 
 # ============================================================================
@@ -1486,7 +1812,10 @@ def resolve_runtime_setting(
 
     # 优先级 1：数据库覆盖
     if key in active_overrides:
-        override_value = _coerce_value(active_overrides[key], spec.value_type)
+        override_value = _coerce_value(_normalize_runtime_override(key, active_overrides[key]), spec.value_type)
+        # 特殊处理：LLM_QUALITY_GATE_SYSTEM_PROMPT 空字符串回退到默认值
+        if key == "LLM_QUALITY_GATE_SYSTEM_PROMPT" and override_value == "":
+            return QUALITY_GATE_SYSTEM_PROMPT_DEFAULT, "code"
         # 特殊处理：空字符串回退到默认值
         if spec.value_type == "str" and override_value == "" and spec.default != "":
             return spec.default, "code"
@@ -1496,7 +1825,14 @@ def resolve_runtime_setting(
     if spec.scope == "env" and spec.env_name:
         env_value = os.environ.get(spec.env_name)
         if env_value is not None and env_value != "":
-            return _coerce_value(env_value, spec.value_type), "env"
+            env_override = _coerce_value(_normalize_runtime_override(key, env_value), spec.value_type)
+            # 特殊处理：LLM_QUALITY_GATE_SYSTEM_PROMPT 空字符串回退到默认值
+            if key == "LLM_QUALITY_GATE_SYSTEM_PROMPT" and env_override == "":
+                return QUALITY_GATE_SYSTEM_PROMPT_DEFAULT, "code"
+            return env_override, "env"
+        # 特殊处理：LLM_QUALITY_GATE_SYSTEM_PROMPT 未设置时返回默认值
+        if key == "LLM_QUALITY_GATE_SYSTEM_PROMPT":
+            return QUALITY_GATE_SYSTEM_PROMPT_DEFAULT, "code"
         return spec.default, "code"
 
     # 优先级 3：配置文件（仅 scope="config"）
@@ -1584,6 +1920,8 @@ def save_runtime_overrides(payload: dict[str, str], updated_by: str = "console")
     try:
         ensure_db_schema(conn)
         with conn.cursor() as cur:
+            # 记录保存前的设置快照，用于版本追踪
+            before_snapshot = _read_console_settings(cur)
             for key, raw_value in payload.items():
                 spec = RUNTIME_SETTING_SPECS.get(key)
                 if spec is None or not isinstance(raw_value, str):
@@ -1612,6 +1950,18 @@ def save_runtime_overrides(payload: dict[str, str], updated_by: str = "console")
                 if spec.scope == "env" and spec.env_name:
                     os.environ[spec.env_name] = stringify_runtime_value(value)
                 updated.append(key)
+            # 如果有更新，记录保存后的快照并创建版本记录
+            if updated:
+                after_snapshot = _read_console_settings(cur)
+                # 计算实际变更的键（值真正发生了变化）
+                changed_keys = sorted({key for key in updated if before_snapshot.get(key) != after_snapshot.get(key)})
+                _create_settings_version(
+                    cur,
+                    action="update",
+                    snapshot=after_snapshot,
+                    changed_keys=changed_keys or sorted(set(updated)),
+                    created_by=updated_by,
+                )
         conn.commit()
     except Exception as exc:
         if hasattr(conn, "rollback"):
@@ -1621,3 +1971,325 @@ def save_runtime_overrides(payload: dict[str, str], updated_by: str = "console")
         conn.close()
 
     return updated
+
+
+def list_runtime_setting_versions(limit: int = 20) -> list[dict[str, Any]]:
+    """
+    列出设置版本历史
+
+    从数据库中读取设置变更的历史版本，用于审计和回滚。
+
+    为什么需要此函数
+    ----------------
+    版本历史是配置管理的核心功能，支持多种运维场景：
+    - **审计合规**: 查看谁在什么时候修改了哪些设置，满足合规审计要求
+    - **问题排查**: 当系统出现异常时，查看最近的配置变更历史
+    - **回滚准备**: 在执行回滚前，查看历史版本确定回滚目标
+    - **变更回顾**: 定期回顾配置变更，优化配置管理流程
+    - **团队协作**: 了解其他管理员的配置操作，避免冲突
+
+    此函数提供只读的历史查询接口，不会修改任何数据。
+
+    参数
+    ----
+    limit : int
+        返回的最大版本数量：
+        - 默认值：20
+        - 最小值：1
+        - 最大值：100
+        - 超出范围的值会被自动约束
+
+    返回
+    ----
+    list[dict[str, Any]]
+        版本记录列表，按创建时间降序排列（最新的在前）
+        每条记录是一个字典，包含：
+        - id: str - 版本 ID（UUID）
+        - action: str - 操作类型（"update" 或 "rollback"）
+        - changedKeys: list[str] - 变更的设置键列表
+        - sourceVersionId: str | None - 源版本 ID（仅回滚操作有值）
+        - createdAt: str - 创建时间（ISO 8601 格式）
+        - createdBy: str - 操作者
+
+    数据库查询
+    ----------
+    SELECT id, action, changed_keys, source_version_id, created_at, created_by
+    FROM console_settings_versions
+    ORDER BY created_at DESC
+    LIMIT %s
+
+    示例
+    ----
+    >>> # 获取最近 10 条版本记录
+    >>> versions = list_runtime_setting_versions(limit=10)
+    >>> for v in versions:
+    ...     print(f"[{v['createdAt']}] {v['action']} by {v['createdBy']}")
+    ...     print(f"  Changed: {', '.join(v['changedKeys'])}")
+    ...
+    [2025-01-15T10:30:00] update by admin
+      Changed: LLM_EMBEDDING_MODEL
+    [2025-01-15T09:20:00] rollback by admin
+      Changed: LLM_EMBEDDING_BATCH_SIZE, LLM_EMBEDDING_MODEL
+
+    >>> # 查看特定版本的详细信息
+    >>> versions = list_runtime_setting_versions(limit=1)
+    >>> if versions:
+    ...     latest = versions[0]
+    ...     print(f"最新版本 ID: {latest['id']}")
+    ...     print(f"操作: {latest['action']}")
+    ...     print(f"时间: {latest['createdAt']}")
+
+    返回值示例
+    ----------
+    [
+        {
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "action": "update",
+            "changedKeys": ["LLM_EMBEDDING_MODEL"],
+            "sourceVersionId": None,
+            "createdAt": "2025-01-15T10:30:00",
+            "createdBy": "admin"
+        },
+        {
+            "id": "550e8400-e29b-41d4-a716-446655440001",
+            "action": "rollback",
+            "changedKeys": ["LLM_EMBEDDING_BATCH_SIZE"],
+            "sourceVersionId": "550e8400-e29b-41d4-a716-446655440002",
+            "createdAt": "2025-01-15T09:20:00",
+            "createdBy": "admin"
+        }
+    ]
+
+    异常
+    ----
+    RuntimeError: 数据库不可用或查询失败
+
+    注意
+    ----
+    - 此函数返回的是元数据，不包含完整的设置快照
+    - 如需查看完整快照，请使用 rollback_runtime_settings 前读取
+    - 返回的 createdAt 是 ISO 8601 格式的字符串，便于前端展示
+    """
+    try:
+        conn = get_db_connection()
+    except Exception as exc:
+        raise RuntimeError("Database unavailable while reading console setting versions") from exc
+
+    try:
+        ensure_db_schema(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, action, changed_keys, source_version_id, created_at, created_by
+                FROM console_settings_versions
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit or 20), 100)),),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        raise RuntimeError("Failed to read console setting versions") from exc
+    finally:
+        conn.close()
+
+    return [
+        {
+            "id": str(row[0]),
+            "action": str(row[1] or ""),
+            "changedKeys": [str(item) for item in (row[2] or [])],
+            "sourceVersionId": str(row[3]) if row[3] else None,
+            "createdAt": row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4] or ""),
+            "createdBy": str(row[5] or ""),
+        }
+        for row in rows
+    ]
+
+
+def rollback_runtime_settings(version_id: str, updated_by: str = "console") -> dict[str, Any]:
+    """
+    回滚设置到指定版本
+
+    将当前的控制台设置回滚到指定的历史版本。
+    这是一个破坏性操作，会完全替换当前设置。
+
+    为什么需要此函数
+    ----------------
+    回滚能力是企业级配置管理的必备功能，解决多种运维问题：
+    - **配置错误恢复**: 当错误的配置导致系统异常时，快速恢复到正常状态
+    - **批量撤销**: 撤销某次部署或变更中的所有配置修改
+    - **灾难恢复**: 在配置灾难性错误后，恢复到已知良好的状态
+    - **实验回退**: 在测试新配置后，回退到生产配置
+    - **合规要求**: 满足变更管理的回滚要求
+
+    回滚操作会创建新的版本记录（action="rollback"），保持历史链完整，
+    便于后续审计和再次回滚。
+
+    参数
+    ----
+    version_id : str
+        目标版本 ID（来自 list_runtime_setting_versions 的返回值）
+        必须是非空字符串
+
+    updated_by : str
+        执行回滚操作的标识，用于审计追踪：
+        - 默认值："console"
+        - 建议使用用户名或系统标识
+
+    返回
+    ----
+    dict[str, Any]
+        回滚结果字典，包含：
+        - rolledBack: bool - 是否成功回滚
+        - versionId: str - 版本 ID
+        - updated: list[str] - 被更新的设置键列表
+        - count: int - 被更新的设置数量
+
+    回滚流程
+    --------
+    1. 验证 version_id 非空
+    2. 连接数据库，开启事务
+    3. 记录回滚前的设置快照
+    4. 读取目标版本的设置快照
+    5. 清空当前所有设置
+    6. 写入目标版本的设置
+    7. 更新环境变量（scope="env" 的设置）
+    8. 创建回滚版本记录（action="rollback"）
+    9. 提交事务，返回结果
+
+    示例
+    ----
+    >>> # 查看历史版本，选择回滚目标
+    >>> versions = list_runtime_setting_versions(limit=10)
+    >>> print("可用版本：")
+    >>> for v in versions:
+    ...     print(f"  [{v['id']}] {v['createdAt']} - {v['action']}")
+    ...
+    >>> # 选择一个版本进行回滚
+    >>> target_version = versions[2]["id"]
+    >>> result = rollback_runtime_settings(target_version, updated_by="admin")
+    >>> print(f"回滚结果: {result}")
+    {'rolledBack': True, 'versionId': '550e8400...', 'updated': ['LLM_EMBEDDING_MODEL', ...], 'count': 5}
+
+    >>> # 检查回滚是否成功
+    >>> if result["rolledBack"]:
+    ...     print(f"成功回滚了 {result['count']} 个设置")
+    ... else:
+    ...     print("回滚失败，版本可能不存在")
+
+    >>> # 回滚后的环境变量已更新
+    >>> import os
+    >>> print(os.environ.get("LLM_EMBEDDING_MODEL"))  # 已恢复到目标版本的值
+
+    失败场景
+    --------
+    1. version_id 为空 -> ValueError
+    2. 数据库不可用 -> RuntimeError
+    3. 版本 ID 不存在 -> 返回 rolledBack=False
+    4. 事务失败 -> RuntimeError，所有变更已回滚
+
+    返回值示例
+    ----------
+    成功回滚：
+    {
+        "rolledBack": True,
+        "versionId": "550e8400-e29b-41d4-a716-446655440000",
+        "updated": ["LLM_EMBEDDING_MODEL", "LLM_EMBEDDING_BATCH_SIZE"],
+        "count": 2
+    }
+
+    版本不存在：
+    {
+        "rolledBack": False,
+        "versionId": "invalid-version-id",
+        "updated": [],
+        "count": 0
+    }
+
+    异常
+    ----
+    ValueError: version_id 为空或无效
+    RuntimeError: 数据库不可用或回滚失败
+
+    注意
+    ----
+    - 此操作会完全替换当前设置，无法部分回滚
+    - 回滚操作会创建新的版本记录，便于再次回滚
+    - scope="env" 的设置会立即更新环境变量
+    - scope="config" 的设置需要重新加载配置文件
+    - 建议在回滚前确认目标版本的正确性
+    - 执行回滚需要数据库连接和写入权限
+    """
+    normalized_id = str(version_id or "").strip()
+    if not normalized_id:
+        raise ValueError("version_id is required")
+
+    try:
+        conn = get_db_connection()
+    except Exception as exc:
+        raise RuntimeError("Database unavailable while rolling back console settings") from exc
+
+    try:
+        ensure_db_schema(conn)
+        with conn.cursor() as cur:
+            # 记录回滚前的设置快照
+            before_snapshot = _read_console_settings(cur)
+            # 获取目标版本的设置快照
+            cur.execute(
+                """
+                SELECT settings_snapshot
+                FROM console_settings_versions
+                WHERE id = %s
+                """,
+                (normalized_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return {"rolledBack": False, "versionId": normalized_id, "updated": [], "count": 0}
+            # 过滤出已注册的设置
+            snapshot = {
+                str(key): value
+                for key, value in (row[0] or {}).items()
+                if str(key) in RUNTIME_SETTING_SPECS
+            }
+
+            # 清空当前设置并写入目标版本的设置
+            cur.execute("DELETE FROM console_settings")
+            for key, value in snapshot.items():
+                cur.execute(
+                    """
+                    INSERT INTO console_settings(key, value, updated_by)
+                    VALUES(%s, %s::jsonb, %s)
+                    """,
+                    (key, json.dumps(value, ensure_ascii=False), updated_by),
+                )
+                spec = RUNTIME_SETTING_SPECS.get(key)
+                if spec and spec.scope == "env" and spec.env_name:
+                    os.environ[spec.env_name] = stringify_runtime_value(value)
+
+            # 计算被影响的设置键（回滚前后值不同的键）
+            changed_keys = sorted(set(before_snapshot) | set(snapshot))
+            # 创建回滚版本记录
+            _create_settings_version(
+                cur,
+                action="rollback",
+                snapshot=snapshot,
+                changed_keys=changed_keys,
+                created_by=updated_by,
+                source_version_id=normalized_id,
+            )
+        conn.commit()
+    except Exception as exc:
+        if hasattr(conn, "rollback"):
+            conn.rollback()
+        raise RuntimeError("Failed to rollback console settings") from exc
+    finally:
+        conn.close()
+
+    return {
+        "rolledBack": True,
+        "versionId": normalized_id,
+        "updated": changed_keys,
+        "count": len(changed_keys),
+    }

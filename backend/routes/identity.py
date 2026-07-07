@@ -33,7 +33,8 @@ from backend.services.ai_base_sso_service import (
     sync_identity_delta_from_ai_base,
     validate_state,
 )
-from backend.services.identity_service import get_current_identity, is_legacy_header_auth_enabled
+from backend.services.identity_service import audit_access_denied, get_current_identity
+from backend.services.identity_service import is_legacy_header_auth_enabled
 from backend.services.identity_sync_scheduler import get_identity_sync_status
 from core.db.identity import (
     SESSION_COOKIE_NAME,
@@ -104,7 +105,6 @@ def identity_snapshot_users(
         "users": users,
         "count": len(users),
     }
-
 
 
 @router.get("/api/auth/ai-base/config")
@@ -239,6 +239,87 @@ async def ai_base_sso_callback(
 @router.post("/api/auth/ai-base/exchange")
 async def ai_base_sso_exchange(payload: AiBaseExchangeRequest, response: Response) -> dict:
     """
+    AI Base 凭证交换接口（非浏览器方式）
+
+    对于非浏览器的客户端（如移动端、桌面应用、CLI 工具），可以直接使用授权码或 JWT
+    换取会话令牌，无需经过浏览器重定向流程。此接口不会返回重定向，而是直接返回会话信息。
+
+    与浏览器 SSO 流程的区别：
+    - 浏览器 SSO：/launch → 跳转登录 → /callback → 设置 Cookie → 重定向
+    - 非浏览器：直接调用本接口 → 返回会话信息（同时设置 Cookie）
+
+    参数:
+        payload: 交换请求体
+            - code: AI Base 授权码（可选，与 jwt 二选一）
+            - jwt: AI Base JWT 令牌（可选，与 code 二选一）
+            - state: 状态参数（可选，用于防止重放攻击）
+
+    返回值:
+        dict: 会话信息
+            - identity: 用户身份信息
+                - tenantId: 租户 ID
+                - userId: 用户 ID
+                - userName: 用户名
+                - roleCodes: 角色代码列表
+                - isTenantAdmin: 是否租户管理员
+            - expiresAt: 会话过期时间（ISO 8601 格式）
+            - mode: 会话模式（固定为 "ai_base_sso_session"）
+
+    使用场景:
+        - 移动端应用登录
+        - 桌面客户端认证
+        - CLI 工具认证
+        - 服务端到服务端认证
+        - API 客户端获取会话
+
+    请求示例（使用授权码）:
+        ```bash
+        POST /api/auth/ai-base/exchange
+        Content-Type: application/json
+
+        {
+          "code": "auth_code_from_ai_base",
+          "state": "optional_state_value"
+        }
+        ```
+
+    请求示例（使用 JWT）:
+        ```bash
+        POST /api/auth/ai-base/exchange
+        Content-Type: application/json
+
+        {
+          "jwt": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        }
+        ```
+
+    响应示例:
+        ```json
+        {
+          "identity": {
+            "tenantId": "tenant_001",
+            "userId": "user_123",
+            "userName": "张三",
+            "roleCodes": ["TENANT_ADMIN", "USER"],
+            "isTenantAdmin": true
+          },
+          "expiresAt": "2026-07-07T10:00:00Z",
+          "mode": "ai_base_sso_session"
+        }
+        ```
+
+    错误情况:
+        - 400: 请求参数无效（code 和 jwt 都为空）
+        - 401: 凭证无效或已过期
+        - 403: 凭证验证失败或用户无权限
+        - 503: AI Base 服务不可用
+
+    注意事项:
+        - 成功调用后会在响应中设置 httponly 会话 Cookie
+        - 会话有效期由 SSO 配置的 session_ttl_seconds 决定
+        - 建议使用 HTTPS 以保护传输安全
+    """
+    try:
     AI Base 凭证交换接口(非浏览器方式)
 
     对于非浏览器的客户端(如移动端),可以直接用授权码或 JWT 换取会话。
@@ -561,16 +642,47 @@ def _is_super_manager(identity: IdentityContext) -> bool:
 
 def _assert_super_manager(identity: IdentityContext, action: str) -> None:
     if not identity.enforce_access:
+        audit_access_denied(
+            identity,
+            action=action,
+            resource_type="identity_admin",
+            reason_code="NOT_AUTHENTICATED",
+            risk_level="medium",
+        )
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not _is_super_manager(identity):
+        audit_access_denied(
+            identity,
+            action=action,
+            resource_type="identity_admin",
+            reason_code="SUPER_MANAGER_REQUIRED",
+            risk_level="medium",
+            metadata={"requiredRole": TENANT_ADMIN_ROLE_CODE},
+        )
         raise HTTPException(status_code=403, detail=f"Only super administrators can {action}")
 
 
 def _assert_ai_base_server_credentials(client_id: str | None, client_secret: str | None) -> None:
     if not client_id or not client_secret:
+        audit_access_denied(
+            None,
+            action="sso.logout_callback",
+            resource_type="ai_base_server",
+            reason_code="AI_BASE_CLIENT_CREDENTIALS_MISSING",
+            risk_level="high",
+            metadata={"clientIdPresent": bool(client_id), "clientSecretPresent": bool(client_secret)},
+        )
         raise HTTPException(status_code=401, detail="AI Base client credentials are required")
     config = load_sso_config()
     if client_id != config.client_id or client_secret != config.client_secret:
+        audit_access_denied(
+            None,
+            action="sso.logout_callback",
+            resource_type="ai_base_server",
+            reason_code="AI_BASE_CLIENT_CREDENTIALS_INVALID",
+            risk_level="high",
+            metadata={"clientIdPresent": bool(client_id), "clientSecretPresent": bool(client_secret)},
+        )
         raise HTTPException(status_code=403, detail="AI Base client credentials are invalid")
 
 

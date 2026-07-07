@@ -8,6 +8,8 @@
 - 实时获取任务处理进度(通过 Server-Sent Events)
 - 预览、编辑、合并切片草稿
 - 确认将切片写入向量库
+- 网页抓取导入
+- 备份 CSV 导入
 
 这是用户将文档导入知识库的主要入口。
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.services.access_control import require_chunk_draft_access, require_kb_access, require_task_access
 from backend.services.identity_service import get_current_identity
@@ -28,10 +31,16 @@ from backend.services.chunk_draft_service import (
 )
 from core.db.identity import IdentityContext
 from backend.services.ingestion_service import (
+    SKIPPED_FAST_IMPORT_STAGES,
+    SOURCE_TYPE_BACKUP_CSV,
+    SOURCE_TYPE_FILE,
+    SOURCE_TYPE_WEBPAGE,
     confirm_pipeline,
     create_task,
     delete_ingestion_task,
     get_task,
+    is_allowed_file_document,
+    is_backup_csv_filename,
     reset_task_for_retry,
     run_pipeline_and_confirm,
     run_pipeline_real,
@@ -43,6 +52,24 @@ router = APIRouter()
 
 # 文件大小限制:500MB
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+
+
+class WebpageIngestionPayload(BaseModel):
+    """网页抓取导入请求参数"""
+    model_config = ConfigDict(extra="forbid")
+
+    kb_id: str = Field(default="default", max_length=255)
+    url: str = Field(..., min_length=1, max_length=2048)
+    strategy: str = Field(default="hierarchical", max_length=100)
+    subject_type: str = Field(default="general", max_length=100)
+    layout_type: str = Field(default="single_column", max_length=100)
+    max_depth: int = Field(default=1, ge=0, le=2)
+    max_pages: int = Field(default=10, ge=1, le=50)
+    same_domain_only: bool = True
+    include_patterns: list[str] = Field(default_factory=list, max_length=20)
+    exclude_patterns: list[str] = Field(default_factory=list, max_length=20)
+    max_page_bytes: int = Field(default=2 * 1024 * 1024, ge=64 * 1024, le=5 * 1024 * 1024)
+    timeout_seconds: int = Field(default=12, ge=3, le=30)
 
 
 @router.post("/api/ingestion/upload", status_code=202)
@@ -93,10 +120,10 @@ async def upload_document(
         - OpenAPI 方式导入文档
 
     错误情况:
-        - 422: 文件格式错误(不是 PDF)或文件过大(超过 500MB)
+        - 422: 文件格式错误或文件过大(超过 500MB)
     """
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=422, detail="只支持 PDF 文件")
+    if not file.filename or not is_allowed_file_document(file.filename):
+        raise HTTPException(status_code=422, detail="仅支持 PDF、图片和 Office 常见格式")
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
@@ -111,6 +138,8 @@ async def upload_document(
         subject_type=subject_type,
         layout_type=layout_type,
         identity=identity if identity.enforce_access else None,
+        source_type=SOURCE_TYPE_FILE,
+        source_summary=file.filename,
     )
     if auto_confirm:
         background_tasks.add_task(run_pipeline_and_confirm, task_id)
@@ -122,9 +151,230 @@ async def upload_document(
         "status": "pending",
         "filename": file.filename,
         "mode": "real",
+        "source_type": SOURCE_TYPE_FILE,
         "auto_confirm": auto_confirm,
     }
 
+
+@router.post("/api/ingestion/webpage", status_code=202)
+async def ingest_webpage(
+    payload: WebpageIngestionPayload,
+    background_tasks: BackgroundTasks,
+    identity: IdentityContext = Depends(get_current_identity),
+) -> dict:
+    """
+    网页抓取导入
+
+    抓取指定 URL 的网页内容并导入到知识库。支持单页抓取和多页递归抓取，
+    可配置抓取深度、页面数限制、域名限制等参数。
+
+    处理流程：
+    1. 验证 URL 和配置参数
+    2. 创建导入任务
+    3. 后台执行网页抓取
+    4. 解析网页内容
+    5. 按指定策略切片
+    6. 写入向量库
+
+    参数:
+        payload: 网页抓取参数
+            - kb_id: 目标知识库 ID，默认 "default"
+            - url: 要抓取的网页 URL（必填，最大 2048 字符）
+            - strategy: 切片策略，默认 "hierarchical"
+            - subject_type: 文档主题类型，默认 "general"
+            - layout_type: 文档布局类型，默认 "single_column"
+            - max_depth: 递归抓取深度，默认 1（仅当前页），范围 0-2
+            - max_pages: 最大抓取页面数，默认 10，范围 1-50
+            - same_domain_only: 是否仅抓取同域名链接，默认 True
+            - include_patterns: 包含的 URL 模式列表，默认空
+            - exclude_patterns: 排除的 URL 模式列表，默认空
+            - max_page_bytes: 单页最大字节数，默认 2MB，范围 64KB-5MB
+            - timeout_seconds: 单页请求超时时间，默认 12 秒，范围 3-30
+        background_tasks: FastAPI 后台任务队列
+        identity: 当前身份上下文（通过依赖注入）
+
+    返回值:
+        dict: 任务信息
+            - task_id: 任务 ID，用于后续查询状态
+            - status: 任务状态，初始为 "pending"
+            - filename: 抓取的 URL
+            - mode: 运行模式（"real"）
+            - source_type: 来源类型（"webpage"）
+
+    使用场景:
+        - 导入在线文档到知识库
+        - 批量抓取网站内容
+        - 构建网页知识库
+        - 定期更新网页内容
+
+    权限要求:
+        - 需要目标知识库的写入权限
+
+    请求示例:
+        ```bash
+        POST /api/ingestion/webpage
+        Authorization: Bearer <session_token>
+        Content-Type: application/json
+
+        {
+          "kb_id": "kb_docs",
+          "url": "https://docs.example.com/guide",
+          "strategy": "hierarchical",
+          "max_depth": 1,
+          "max_pages": 20,
+          "same_domain_only": true,
+          "include_patterns": ["/guide/", "/api/"],
+          "exclude_patterns": ["/login", "/admin"]
+        }
+        ```
+
+    响应示例:
+        ```json
+        {
+          "task_id": "task_web_001",
+          "status": "pending",
+          "filename": "https://docs.example.com/guide",
+          "mode": "real",
+          "source_type": "webpage"
+        }
+        ```
+
+    错误情况:
+        - 403: 无权访问指定知识库
+        - 422: URL 参数无效或超出限制
+        - 503: 服务不可用
+
+    注意事项:
+        - 抓取任务异步执行，需通过任务状态接口查询进度
+        - 建议设置合理的 max_pages 避免过度抓取
+        - 目标网站需允许爬虫访问（检查 robots.txt）
+    """
+    require_kb_access(payload.kb_id, identity, action="ingestion.webpage", resource_id=payload.kb_id)
+    task_id = create_task(
+        payload.kb_id,
+        payload.url,
+        payload.strategy,
+        subject_type=payload.subject_type,
+        layout_type=payload.layout_type,
+        identity=identity if identity.enforce_access else None,
+        source_type=SOURCE_TYPE_WEBPAGE,
+        source_summary=payload.url,
+        source_url=payload.url,
+        source_options=payload.model_dump(),
+    )
+    background_tasks.add_task(run_pipeline_real, task_id)
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "filename": payload.url,
+        "mode": "real",
+        "source_type": SOURCE_TYPE_WEBPAGE,
+    }
+
+
+@router.post("/api/ingestion/backup-csv", status_code=202)
+async def ingest_backup_csv(
+    background_tasks: BackgroundTasks,
+    file: UploadFile,
+    kb_id: str = "default",
+    identity: IdentityContext = Depends(get_current_identity),
+) -> dict:
+    """
+    备份 CSV 导入（快速恢复）
+
+    导入系统备份的 CSV 文件，用于数据恢复或跨环境迁移。
+    备份 CSV 包含切片内容和向量嵌入，可以快速导入无需重新解析和向量化。
+
+    与普通文件导入的区别：
+    - 跳过 PDF 解析、清洗、切片阶段
+    - 直接导入向量和内容
+    - 处理速度更快（fast_import 模式）
+    - 适用于数据迁移和灾难恢复
+
+    支持的 CSV 格式：
+    - wisewe-rag-backup-v1 格式
+    - 包含 chunk_id, document_id, kb_id, content, embedding 等字段
+
+    参数:
+        background_tasks: FastAPI 后台任务队列
+        file: 上传的备份 CSV 文件
+        kb_id: 目标知识库 ID，默认 "default"
+        identity: 当前身份上下文（通过依赖注入）
+
+    返回值:
+        dict: 任务信息
+            - task_id: 任务 ID，用于后续查询状态
+            - status: 任务状态，初始为 "pending"
+            - filename: 上传的文件名
+            - mode: 运行模式（"fast_import"）
+            - source_type: 来源类型（"backup_csv"）
+
+    使用场景:
+        - 恢复备份的知识库数据
+        - 迁移知识库到新环境
+        - 快速导入已处理的数据
+        - 灾难恢复
+        - 跨租户数据迁移
+
+    权限要求:
+        - 需要目标知识库的写入权限
+
+    请求示例:
+        ```bash
+        POST /api/ingestion/backup-csv?kb_id=kb_restored
+        Authorization: Bearer <session_token>
+        Content-Type: multipart/form-data
+
+        file: backup_kb_demo_20260706.csv
+        ```
+
+    响应示例:
+        ```json
+        {
+          "task_id": "task_backup_001",
+          "status": "pending",
+          "filename": "backup_kb_demo_20260706.csv",
+          "mode": "fast_import",
+          "source_type": "backup_csv"
+        }
+        ```
+
+    错误情况:
+        - 403: 无权访问指定知识库
+        - 422: 文件格式错误（非备份 CSV）或文件过大（超过 500MB）
+        - 503: 服务不可用
+
+    注意事项:
+        - 文件名需符合备份格式：wisewe-rag-backup-*.csv 或 backup-*.csv
+        - 导入前会验证 CSV 格式和必需字段
+        - 如果 kb_id 与备份中的 kb_id 不一致，会更新为目标 kb_id
+        - 建议在导入前清空目标知识库以避免数据冲突
+    """
+    if not file.filename or not is_backup_csv_filename(file.filename):
+        raise HTTPException(status_code=422, detail="只支持系统备份 CSV 文件")
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=422, detail="文件大小不能超过 500MB")
+    require_kb_access(kb_id, identity, action="ingestion.backup_csv", resource_id=kb_id)
+    task_id = create_task(
+        kb_id,
+        file.filename,
+        "backup_csv",
+        file_bytes=content,
+        identity=identity if identity.enforce_access else None,
+        source_type=SOURCE_TYPE_BACKUP_CSV,
+        source_summary=file.filename,
+        fast_import=True,
+        skipped_stages=SKIPPED_FAST_IMPORT_STAGES,
+    )
+    background_tasks.add_task(run_pipeline_real, task_id)
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "filename": file.filename,
+        "mode": "fast_import",
+        "source_type": SOURCE_TYPE_BACKUP_CSV,
+    }
 
 
 @router.get("/api/ingestion/tasks/{task_id}")

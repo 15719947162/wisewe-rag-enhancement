@@ -301,3 +301,111 @@ def is_redis_available() -> bool:
         bool: Redis 是否可用
     """
     return _get_redis() is not None
+
+
+def get_task_store_diagnostics() -> dict[str, Any]:
+    """
+    获取任务存储的诊断信息
+
+    用于监控和调试任务存储状态，帮助运维人员了解：
+    - 当前使用的是 Redis 还是内存存储
+    - 存储中有多少任务
+    - Redis 的内存使用情况
+    - TTL（生存时间）配置
+
+    这对以下场景非常有用：
+    1. 健康检查：快速确认 Redis 连接状态
+    2. 容量规划：监控任务数量和内存使用
+    3. 问题排查：诊断存储相关的问题
+    4. 运维监控：集成到监控面板或告警系统
+
+    返回：
+        dict[str, Any]: 诊断信息字典，包含以下字段：
+
+        - mode (str): 存储模式，"redis" 或 "memory"
+        - redisAvailable (bool): Redis 是否可用
+        - taskCount (int): 当前存储的任务数量
+        - ttlSeconds (int): 单个任务的 TTL（秒），默认 7 天
+        - allKeyTtlSeconds (int): 任务 ID 集合的剩余 TTL（秒），
+          仅 Redis 模式有效，0 表示无 TTL 或不可用
+        - usedMemoryHuman (str): Redis 内存使用量（人类可读格式），
+          如 "1.2M"，仅 Redis 模式有效，空字符串表示获取失败
+
+    使用示例：
+
+        基础使用：
+            from backend.services.task_store import get_task_store_diagnostics
+
+            # 获取诊断信息
+            diag = get_task_store_diagnostics()
+            print(f"存储模式: {diag['mode']}")
+            print(f"任务数量: {diag['taskCount']}")
+            print(f"Redis 可用: {diag['redisAvailable']}")
+
+        API 端点集成：
+            from fastapi import APIRouter
+            from backend.services.task_store import get_task_store_diagnostics
+
+            router = APIRouter()
+
+            @router.get("/diagnostics")
+            async def get_diagnostics():
+                '''返回任务存储诊断信息'''
+                return get_task_store_diagnostics()
+
+        监控告警示例：
+            diag = get_task_store_diagnostics()
+
+            # 检查 Redis 可用性
+            if not diag["redisAvailable"]:
+                logger.warning("Redis 不可用，使用内存存储（重启后数据丢失）")
+
+            # 检查任务积压
+            if diag["taskCount"] > 1000:
+                logger.warning(f"任务数量过多: {diag['taskCount']}")
+
+            # 检查内存使用
+            if diag["usedMemoryHuman"]:
+                logger.info(f"Redis 内存使用: {diag['usedMemoryHuman']}")
+
+    安全说明：
+        此函数不会暴露原始的 Redis key 名称或任务内容，
+        只返回聚合的统计信息，适合暴露给外部监控系统。
+    """
+    r = _get_redis()
+    if r is None:
+        return {
+            "mode": "memory",
+            "redisAvailable": False,
+            "taskCount": len(_mem_tasks),
+            "ttlSeconds": _TASK_TTL,
+            "allKeyTtlSeconds": 0,
+            "usedMemoryHuman": "",
+        }
+
+    try:
+        ids = r.smembers(_ALL_KEY)
+    except Exception:
+        ids = set()
+
+    try:
+        all_key_ttl = int(r.ttl(_ALL_KEY) or 0)
+    except Exception:
+        all_key_ttl = 0
+
+    used_memory = ""
+    try:
+        info = r.info("memory")
+        if isinstance(info, dict):
+            used_memory = str(info.get("used_memory_human") or "")
+    except Exception:
+        used_memory = ""
+
+    return {
+        "mode": "redis",
+        "redisAvailable": True,
+        "taskCount": len(ids),
+        "ttlSeconds": _TASK_TTL,
+        "allKeyTtlSeconds": all_key_ttl,
+        "usedMemoryHuman": used_memory,
+    }
