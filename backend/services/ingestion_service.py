@@ -264,6 +264,18 @@ def _set_stage(
 
 
 class _ParseStageTracker:
+    """
+    解析阶段日志跟踪器。
+
+    作用：
+    1. 接收解析器不断输出的自然语言日志
+    2. 从日志里提取分片数、完成数、轮询次数等指标
+    3. 推导一个较稳定的 parse 阶段进度百分比
+
+    这样前端和任务详情页不需要自己理解解析器日志，
+    只消费这里整理好的阶段状态即可。
+    """
+
     def __init__(self, task_id: str, provider: str) -> None:
         self.task_id = task_id
         self.provider = provider
@@ -382,6 +394,8 @@ class _ParseStageTracker:
 
 
 def _chunk_progress_from_message(message: str) -> int | None:
+    # hierarchical 切片阶段输出的是自由文本日志，不是结构化进度。
+    # 这里把几个关键短语映射成粗粒度百分比，供任务 UI 显示。
     percent_match = re.search(r"\((\d+)%\)", message)
     if "正在扫描内容块" in message and percent_match:
         return 5 + int(int(percent_match.group(1)) * 0.25)
@@ -485,6 +499,20 @@ def _record_ingestion_llm_usage(
     status: str = "success",
     error_code: str | None = None,
 ) -> None:
+    """
+    把入库链路某个阶段的 LLM 用量写入统一账本。
+
+    这个函数不关心调用发生在 clean、chunk、quality 还是 embedding，
+    它只做一件事：
+    把阶段内收集到的 token/耗时/provider/model 信息，
+    统一转换成 `kb_llm_call_logs` 可接受的记录格式。
+
+    这样做的好处是：
+    1. 离线入库和在线问答使用同一套 LLM 调用观测口径
+    2. 控制台可以按阶段回看成本
+    3. 后续统计小时用量和账单时不需要再区分来源
+    """
+
     prompt_tokens = int(metrics.get(f"{token_prefix}PromptTokens", 0) or 0)
     completion_tokens = int(metrics.get(f"{token_prefix}CompletionTokens", 0) or 0)
     total_tokens = int(metrics.get(f"{token_prefix}TotalTokens", 0) or 0)
@@ -673,6 +701,22 @@ def _load_task_or_raise(task_id: str) -> dict:
 
 
 async def run_pipeline_real(task_id: str) -> None:
+    """
+    执行“确认前”的真实入库链路。
+
+    这条链路负责把源文件一路处理到 chunk 草稿：
+    1. 准备源文件
+    2. 调解析器拿到 ContentBlock
+    3. 做清洗
+    4. 做切片与增强
+    5. 建立基础关系
+    6. 保存到 chunk_drafts
+
+    它故意不直接写入正式知识库，
+    因为正式入库还要经过质量门控、向量化、关系补全和写库阶段，
+    那部分由 confirm_pipeline(...) 负责。
+    """
+
     task = get_task(task_id)
     if not task:
         return
@@ -830,6 +874,10 @@ async def run_pipeline_real(task_id: str) -> None:
 
         strategy_kwargs = {}
         requested_ready_mode, ready_mode_source = _resolve_ingestion_ready_mode()
+        # 只有 hierarchical 策略支持 basic-ready 模式。
+        # 这个模式的核心不是换一套切片策略，
+        # 而是在保留 parent/child 基础结构的前提下跳过 enhanced 层，
+        # 用更低成本更快地产出“可先用”的草稿结果。
         effective_ready_mode = "basic" if task["strategy"] == "hierarchical" and requested_ready_mode == "basic" else "full"
         task["ingestion_ready_mode"] = effective_ready_mode
         task["ingestion_ready_mode_requested"] = requested_ready_mode
@@ -963,6 +1011,21 @@ async def run_pipeline_and_confirm(task_id: str) -> None:
 
 
 async def confirm_pipeline(task_id: str) -> dict:
+    """
+    执行“确认后”的正式入库链路。
+
+    输入不是原始文件，而是前半段链路已经产出的 chunk 草稿。
+    这里负责把草稿转成正式知识库数据，顺序是：
+    1. 质量门控
+    2. 向量化
+    3. 语义/流程/因果关系补全
+    4. 实体物化
+    5. 正式写入 pgvector 相关表
+
+    可以把这个函数理解成：
+    “把可预览草稿，升级成正式可检索数据”。
+    """
+
     task = _load_task_or_raise(task_id)
     chunks = await asyncio.to_thread(load_confirmable_chunks, task_id)
     if not chunks:
@@ -1122,6 +1185,16 @@ async def confirm_pipeline(task_id: str) -> dict:
 
 
 async def _finalize_pipeline(task_id: str, chunks: list) -> dict:
+    """
+    直通模式下的收口函数。
+
+    某些链路会在 chunk 生成后直接进入正式入库，
+    不经过人工确认页面。
+    这里先把草稿预览信息写回任务状态，
+    然后复用 confirm_pipeline(...) 的后半段逻辑，
+    避免维护两套正式写库流程。
+    """
+
     task = _load_task_or_raise(task_id)
     task["awaiting_confirmation"] = False
     task["chunk_count"] = len(chunks)
@@ -1134,6 +1207,17 @@ async def _finalize_pipeline(task_id: str, chunks: list) -> dict:
 
 
 async def stream_task_events(task_id: str) -> AsyncIterator[str]:
+    """
+    向前端持续推送任务执行事件。
+
+    这里同时推两类信息：
+    1. 原始日志行：方便调试和排查
+    2. 结构化阶段快照：方便前端直接渲染进度条和状态文案
+
+    这样前端不需要自己解析后端日志，
+    也不需要频繁轮询整个任务详情。
+    """
+
     import json as _json
 
     task = get_task(task_id)
