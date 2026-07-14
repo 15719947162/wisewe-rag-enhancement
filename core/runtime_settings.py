@@ -1080,6 +1080,21 @@ RUNTIME_SETTING_SPECS: dict[str, RuntimeSettingSpec] = {
 }
 
 # ============================================================================
+# 仅环境变量运行时设置
+# 这些设置只能通过环境变量配置，不能在控制台中修改
+# ============================================================================
+
+ENV_ONLY_RUNTIME_SETTING_KEYS: set[str] = {
+    "LLM_QUALITY_GATE_BASE_URL",
+    "LLM_QUALITY_GATE_API_KEY",
+    "LLM_QUALITY_GATE_API_KEY_POOL",
+    "LLM_QUALITY_GATE_KEY_RETRIES",
+    "LLM_QUALITY_GATE_KEY_COOLDOWN_SECONDS",
+    "LLM_QUALITY_GATE_BATCH_SIZE",
+    "LLM_QUALITY_GATE_MAX_CONCURRENCY",
+}
+
+# ============================================================================
 # 类型转换工具函数
 # ============================================================================
 

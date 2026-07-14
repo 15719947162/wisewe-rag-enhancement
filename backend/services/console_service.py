@@ -12,6 +12,8 @@
 8. Token 使用统计
 9. API Key 管理
 10. OpenAPI App 管理
+11. 外部系统配置管理
+12. 用量与成本统计
 
 服务层职责：
 - 聚合多个数据源的数据
@@ -23,6 +25,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,6 +49,7 @@ from core.db.api_keys import (
 from core.db.external_system_configs import (
     create_external_system_config,
     delete_external_system_config,
+    list_external_identity_sources,
     list_external_system_configs,
     update_external_system_config,
 )
@@ -56,22 +60,45 @@ from core.db.query_logs import (
     append_audit_log,
     fetch_app_usage_report_for_identity,
     fetch_audit_logs,
+    fetch_processing_cost_document_detail_for_identity,
+    fetch_processing_cost_documents_for_identity,
+    fetch_project_cost_estimates_for_identity,
+    fetch_processing_cost_task_detail_for_identity,
+    fetch_processing_cost_tasks_for_identity,
     fetch_rag_query_logs,
     fetch_token_usage_summary_for_identity,
+    refresh_processing_cost_estimates,
 )
 from core.db.query_logs import export_rag_query_logs_csv
 from core.db.connection import is_db_available
 from core.runtime_settings import (
     RUNTIME_SETTING_SPECS,
     list_runtime_setting_versions,
+    load_runtime_overrides,
     resolve_runtime_setting,
     rollback_runtime_settings,
     save_runtime_overrides,
     stringify_runtime_value,
 )
 
-EDITABLE_SETTINGS_KEYS = set(RUNTIME_SETTING_SPECS.keys())
+# 仅允许通过环境变量设置的配置项，不能在控制台编辑
+CONSOLE_ENV_ONLY_SETTINGS_KEYS = {
+    "LLM_QUALITY_GATE_BASE_URL",
+    "LLM_QUALITY_GATE_API_KEY",
+    "LLM_QUALITY_GATE_API_KEY_POOL",
+    "LLM_QUALITY_GATE_KEY_RETRIES",
+    "LLM_QUALITY_GATE_KEY_COOLDOWN_SECONDS",
+    "LLM_QUALITY_GATE_BATCH_SIZE",
+    "LLM_QUALITY_GATE_MAX_CONCURRENCY",
+}
+
+# 可编辑的配置项集合（排除仅环境变量配置）
+EDITABLE_SETTINGS_KEYS = set(RUNTIME_SETTING_SPECS.keys()) - CONSOLE_ENV_ONLY_SETTINGS_KEYS
+
+# 敏感配置项的识别标识
 SENSITIVE_SETTING_TOKENS = ("api_key", "access_key", "credential", "secret", "password", "token")
+
+# 脱敏值的前缀标识
 MASKED_SETTING_PREFIX = "****"
 
 
@@ -89,6 +116,7 @@ def _entry(
     source: str = "env",
     sensitive: bool = False,
     has_value: bool | None = None,
+    value_type: str = "str",
 ) -> dict[str, object]:
     """
     构建配置项数据结构
@@ -103,6 +131,7 @@ def _entry(
         source: 值来源（env/config/code/db）
         sensitive: 是否敏感（需脱敏）
         has_value: 是否有值
+        value_type: 值类型（str/int/bool/json 等）
 
     返回：
         dict: 配置项数据
@@ -115,6 +144,7 @@ def _entry(
         "category": category,
         "editable": editable,
         "source": source,
+        "valueType": value_type,
         "sensitive": sensitive,
         "hasValue": (string_value != "") if has_value is None else has_value,
         "configScope": "global",
@@ -249,6 +279,456 @@ def sanitize_console_settings_update(payload: dict) -> dict[str, str]:
     return safe_payload
 
 
+class _SettingsBuildContext:
+    """
+    配置构建上下文
+
+    用于在构建配置列表时缓存配置加载结果，避免重复加载。
+    支持运行时配置和静态配置的统一构建。
+
+    属性：
+        config: 配置字典
+        overrides: 运行时覆盖字典
+        runtime_entries: 已构建的运行时配置项缓存
+        parser_cfg: 解析器配置
+        parser_oss_cfg: OSS 配置
+        output_cfg: 输出配置
+        pgvector_cfg: 向量数据库配置
+    """
+
+    def __init__(self) -> None:
+        """初始化配置构建上下文"""
+        self.config = load_config()
+        self.overrides = load_runtime_overrides()
+        self.runtime_entries: dict[str, dict[str, object]] = {}
+        self.parser_cfg = self.config.get("parser", {})
+        self.parser_oss_cfg = self.parser_cfg.get("oss", {})
+        self.output_cfg = self.config.get("output", {})
+        self.pgvector_cfg = self.config.get("pgvector", {})
+
+    def runtime(self, key: str) -> dict[str, object]:
+        """
+        获取运行时配置项
+
+        如果配置项未缓存，则从运行时配置中解析并缓存。
+
+        参数：
+            key: 配置项名称
+
+        返回：
+            dict: 配置项数据
+        """
+        if key not in self.runtime_entries:
+            value, source = resolve_runtime_setting(key, config=self.config, overrides=self.overrides)
+            sensitive = _is_sensitive_setting(key)
+            self.runtime_entries[key] = _entry(
+                key,
+                _mask_sensitive_value(value) if sensitive else value,
+                category=RUNTIME_SETTING_SPECS[key].category,
+                editable=True,
+                source=source,
+                sensitive=sensitive,
+                has_value=stringify_runtime_value(value) != "",
+                value_type=RUNTIME_SETTING_SPECS[key].value_type,
+            )
+        return self.runtime_entries[key]
+
+
+# 配置项工厂函数类型
+SettingValueFactory = Callable[[_SettingsBuildContext], dict[str, object]]
+
+
+def _runtime_setting_entry(key: str) -> SettingValueFactory:
+    """
+    创建运行时配置项工厂函数
+
+    参数：
+        key: 配置项名称
+
+    返回：
+        SettingValueFactory: 工厂函数
+    """
+    return lambda ctx: ctx.runtime(key)
+
+
+def _static_setting_entry(
+    label: str,
+    value: object | Callable[[_SettingsBuildContext], object],
+    *,
+    source: str = "code",
+) -> SettingValueFactory:
+    """
+    创建静态配置项工厂函数
+
+    参数：
+        label: 配置项名称
+        value: 配置值或值函数
+        source: 值来源
+
+    返回：
+        SettingValueFactory: 工厂函数
+    """
+    return lambda ctx: _entry(label, value(ctx) if callable(value) else value, source=source)
+
+
+def _settings_group_specs() -> list[dict[str, object]]:
+    """
+    获取配置分组规格定义
+
+    定义所有配置分组的元信息和配置项列表。
+
+    返回：
+        list[dict]: 配置分组规格列表，每个分组包含：
+            - id: 分组 ID
+            - title: 分组标题
+            - description: 分组描述
+            - items: 配置项工厂函数列表
+    """
+    return [
+        {
+            "id": "models_common",
+            "title": "通用模型",
+            "description": "默认 LLM 服务地址与通用密钥，供未单独配置的清洗、切片、增强等功能复用。",
+            "items": [
+                _runtime_setting_entry("LLM_BASE_URL"),
+                _runtime_setting_entry("LLM_API_KEY"),
+            ],
+        },
+        {
+            "id": "models_embedding",
+            "title": "向量模型",
+            "description": "负责切片向量化与向量检索的 embedding 模型配置。",
+            "items": [
+                _runtime_setting_entry("LLM_EMBEDDING_MODEL"),
+                _runtime_setting_entry("LLM_EMBEDDING_BATCH_SIZE"),
+                _runtime_setting_entry("LLM_EMBEDDING_MAX_CONCURRENCY"),
+                _runtime_setting_entry("LLM_EMBEDDING_MAX_RETRIES"),
+                _runtime_setting_entry("LLM_EMBEDDING_API_KEY_POOL"),
+                _runtime_setting_entry("LLM_EMBEDDING_KEY_RETRIES"),
+                _runtime_setting_entry("LLM_EMBEDDING_KEY_COOLDOWN_SECONDS"),
+                _runtime_setting_entry("RAG_RETRIEVAL_SNAPSHOT"),
+            ],
+        },
+        {
+            "id": "models_cleaner",
+            "title": "清洗模型",
+            "description": "负责解析后文本清洗、噪声过滤与教材内容保留的模型和系统提示词。",
+            "items": [
+                _runtime_setting_entry("LLM_CLEANER_ENABLED"),
+                _runtime_setting_entry("LLM_CLEANER_MODEL"),
+                _runtime_setting_entry("LLM_CLEANER_BASE_URL"),
+                _runtime_setting_entry("LLM_CLEANER_API_KEY"),
+                _runtime_setting_entry("LLM_CLEANER_SYSTEM_PROMPT"),
+            ],
+        },
+        {
+            "id": "models_chunker",
+            "title": "切片模型",
+            "description": "负责 LLM 切片边界判断的系统提示词，强调知识点完整性与可引用粒度。",
+            "items": [
+                _runtime_setting_entry("LLM_CHUNKER_SYSTEM_PROMPT"),
+            ],
+        },
+        {
+            "id": "models_quality",
+            "title": "质量审核模型",
+            "description": "负责切片质量门控，避免过滤掉短图注、表格、公式和题目等有效教材证据。",
+            "items": [
+                _runtime_setting_entry("LLM_QUALITY_GATE_ENABLED"),
+                _runtime_setting_entry("LLM_QUALITY_GATE_MODEL"),
+                _runtime_setting_entry("LLM_QUALITY_GATE_MIN_SCORE"),
+                _runtime_setting_entry("LLM_QUALITY_GATE_SYSTEM_PROMPT"),
+            ],
+        },
+        {
+            "id": "models_enhance",
+            "title": "三层增强模型",
+            "description": "负责 parent/child/enhanced 链路中的切片摘要、图片描述、表格摘要和结构化抽取提示词。",
+            "items": [
+                _runtime_setting_entry("LLM_ENHANCE_SYSTEM_PROMPT"),
+            ],
+        },
+        {
+            "id": "models_rag",
+            "title": "问答生成模型",
+            "description": "负责在线问答生成与引用约束。建议明确要求基于上下文回答，不足时直说无法可靠回答。",
+            "items": [
+                _runtime_setting_entry("RAG_LLM_ENABLED"),
+                _runtime_setting_entry("RAG_LLM_MODEL"),
+                _runtime_setting_entry("RAG_LLM_BASE_URL"),
+                _runtime_setting_entry("RAG_LLM_API_KEY"),
+                _runtime_setting_entry("RAG_SYSTEM_PROMPT"),
+            ],
+        },
+        {
+            "id": "usage_cost",
+            "title": "用量与成本",
+            "description": "模型 Token 可信费率与 OSS / 解析项目预估费率。模型费率优先，全局费率仅作兜底。",
+            "items": [
+                _runtime_setting_entry("KB_TOKEN_MODEL_RATES_JSON"),
+                _runtime_setting_entry("KB_PROCESSING_COST_RATES_JSON"),
+                _runtime_setting_entry("KB_TOKEN_COST_CURRENCY"),
+                _runtime_setting_entry("KB_TOKEN_COST_PER_1K_PROMPT"),
+                _runtime_setting_entry("KB_TOKEN_COST_PER_1K_COMPLETION"),
+                _runtime_setting_entry("KB_TOKEN_COST_PER_1K_TOTAL"),
+            ],
+        },
+        {
+            "id": "identity_sso",
+            "title": "身份与 SSO",
+            "description": "AI 基座身份接入、SSO 跳转与身份快照同步路径配置。支持服务端配置化管理接口前缀，避免硬编码。",
+            "items": [
+                _runtime_setting_entry("AI_BASE_SSO_BASE_URL"),
+                _runtime_setting_entry("AI_BASE_SSO_CLIENT_ID"),
+                _runtime_setting_entry("AI_BASE_SSO_CLIENT_SECRET"),
+                _runtime_setting_entry("AI_BASE_SSO_REDIRECT_URI"),
+                _runtime_setting_entry("AI_BASE_SSO_LAUNCH_BASE_URL"),
+                _runtime_setting_entry("AI_BASE_SSO_LAUNCH_PATH"),
+                _runtime_setting_entry("AI_BASE_SSO_EXCHANGE_PATH"),
+                _runtime_setting_entry("AI_BASE_SSO_USER_SNAPSHOT_PATH_TEMPLATE"),
+                _runtime_setting_entry("AI_BASE_SSO_DELTA_PATH"),
+                _runtime_setting_entry("KB_CONSOLE_BASE_URL"),
+                _runtime_setting_entry("KB_SESSION_TTL_SECONDS"),
+                _runtime_setting_entry("AI_BASE_IDENTITY_SYNC_ENABLED"),
+                _runtime_setting_entry("AI_BASE_IDENTITY_SYNC_INTERVAL_SECONDS"),
+                _runtime_setting_entry("AI_BASE_IDENTITY_SYNC_RUN_ON_STARTUP"),
+                _runtime_setting_entry("KB_IDENTITY_SNAPSHOT_MAX_AGE_SECONDS"),
+                _runtime_setting_entry("KB_CORS_ALLOW_ORIGINS"),
+                _runtime_setting_entry("KB_CORS_ALLOW_HEADERS"),
+            ],
+        },
+        {
+            "id": "parser",
+            "title": "解析配置",
+            "description": "MinerU 云解析关键参数与 302AI 接入配置。支持覆盖 parse_method、OCR、语言、模型版本等。",
+            "items": [
+                _static_setting_entry("PARSER_MODE", lambda ctx: ctx.parser_cfg.get("mode", "cloud"), source="config"),
+                _runtime_setting_entry("PDF_PARSER_PROVIDER"),
+                _runtime_setting_entry("PDF_PARSER_FALLBACKS"),
+                _runtime_setting_entry("parser.cloud.parse_method"),
+                _runtime_setting_entry("parser.cloud.version"),
+                _runtime_setting_entry("parser.cloud.timeout"),
+                _runtime_setting_entry("parser.cloud.poll_interval"),
+                _runtime_setting_entry("parser.cloud.enable_formula"),
+                _runtime_setting_entry("parser.cloud.enable_table_html"),
+                _runtime_setting_entry("parser.cloud.language"),
+                _runtime_setting_entry("parser.cloud.is_ocr"),
+                _runtime_setting_entry("parser.cloud.model_version"),
+                _runtime_setting_entry("parser.cloud.sharding.enabled"),
+                _runtime_setting_entry("parser.cloud.sharding.min_pages"),
+                _runtime_setting_entry("parser.cloud.sharding.min_file_mb"),
+                _runtime_setting_entry("parser.cloud.sharding.pages_per_shard"),
+                _runtime_setting_entry("parser.cloud.sharding.max_concurrency"),
+                _runtime_setting_entry("parser.cloud.sharding.text_sample_pages"),
+                _runtime_setting_entry("302AI_API_BASE"),
+                _runtime_setting_entry("302AI_API_KEY"),
+                _runtime_setting_entry("MINERU_OFFICIAL_API_BASE"),
+                _runtime_setting_entry("MINERU_OFFICIAL_API_TOKEN"),
+                _runtime_setting_entry("MINERU_OFFICIAL_MODEL_VERSION"),
+                _runtime_setting_entry("MINERU_OFFICIAL_TIMEOUT"),
+                _runtime_setting_entry("MINERU_OFFICIAL_POLL_INTERVAL"),
+                _runtime_setting_entry("MINERU_OFFICIAL_ENABLE_FORMULA"),
+                _runtime_setting_entry("MINERU_OFFICIAL_ENABLE_TABLE"),
+                _runtime_setting_entry("MINERU_OFFICIAL_LANGUAGE"),
+                _runtime_setting_entry("MINERU_OFFICIAL_IS_OCR"),
+                _runtime_setting_entry("MINERU_OFFICIAL_EXTRA_FORMATS"),
+                _runtime_setting_entry("MINERU_OFFICIAL_NO_CACHE"),
+                _runtime_setting_entry("MINERU_OFFICIAL_CACHE_TOLERANCE"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SUBMIT_RETRY_ATTEMPTS"),
+                _runtime_setting_entry("MINERU_OFFICIAL_POLL_RETRY_ATTEMPTS"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_ENABLED"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_MIN_FILE_MB"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_MIN_PAGES"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_PAGES_PER_SHARD"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_MAX_CONCURRENCY"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_MAX_FILE_MB_PER_SHARD"),
+                _runtime_setting_entry("MINERU_OFFICIAL_SHARDING_TEXT_SAMPLE_PAGES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_ENDPOINT"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_OUTPUT_FORMAT"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_TIMEOUT"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_POLL_INTERVAL"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_ACCESS_KEY_ID"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_ACCESS_KEY_SECRET"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_CREDENTIAL_POOL"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_MAX_INFLIGHT_PER_KEY"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_KEY_RETRIES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_KEY_COOLDOWN_SECONDS"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_KEY_PROBE_CONCURRENCY"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_LLM_ENHANCEMENT"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_ENHANCEMENT_MODE"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_LAYOUT_STEP_SIZE"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_RESULT_FETCH_RETRIES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_EMPTY_RESULT_RETRIES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_EMPTY_RESULT_RETRY_DELAY"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_HEDGED_SHARD_ENABLED"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_HEDGE_AFTER_SECONDS"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_HEDGE_MAX_EXTRA_ATTEMPTS"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_ENABLED"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_MIN_FILE_MB"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_MIN_PAGES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_PAGES_PER_SHARD"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_MAX_CONCURRENCY"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_MIN_PAGES_PER_SHARD"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_TARGET_WAVES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARDING_TEXT_SAMPLE_PAGES"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_WEIGHTED_SHARDING_ENABLED"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_HEAVY_SHARD_FIRST"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARD_SAVE_GARBAGE"),
+                _runtime_setting_entry("ALIYUN_DOCUMENT_MIND_SHARD_SAVE_DEFLATE"),
+            ],
+        },
+        {
+            "id": "chunking",
+            "title": "切片参数",
+            "description": "展示当前切片策略的默认参数与提示词入口，便于核对运行时行为。",
+            "items": [
+                _static_setting_entry("DEFAULT_INGESTION_STRATEGY", "hierarchical"),
+                _static_setting_entry("FIXED_LENGTH_CHUNK_SIZE", 1000),
+                _static_setting_entry("FIXED_LENGTH_OVERLAP", 50),
+                _static_setting_entry("PARAGRAPH_MIN_CHARS", 64),
+                _static_setting_entry("PARAGRAPH_MAX_CHARS", 512),
+                _static_setting_entry("SEMANTIC_MAX_CHUNK_SIZE", 1000),
+                _static_setting_entry("LLM_MAX_CHUNK_SIZE", 800),
+                _static_setting_entry("HIERARCHICAL_CHILD_MAX_CHARS", 600),
+                _runtime_setting_entry("INGESTION_READY_MODE"),
+                _runtime_setting_entry("HIERARCHICAL_ENHANCE_MODE"),
+                _runtime_setting_entry("HIERARCHICAL_TEXT_ENHANCE_WORKERS"),
+                _runtime_setting_entry("HIERARCHICAL_TABLE_ENHANCE_WORKERS"),
+                _runtime_setting_entry("HIERARCHICAL_IMAGE_ENHANCE_WORKERS"),
+                _runtime_setting_entry("HIERARCHICAL_ENHANCE_MAX_CONCURRENCY"),
+                _runtime_setting_entry("HIERARCHICAL_REUSE_LLM_CLIENTS"),
+                _runtime_setting_entry("LLM_API_KEY_POOL"),
+                _runtime_setting_entry("VL_API_KEY_POOL"),
+                _runtime_setting_entry("HIERARCHICAL_ENHANCE_KEY_RETRIES"),
+                _runtime_setting_entry("HIERARCHICAL_KEY_COOLDOWN_SECONDS"),
+                _runtime_setting_entry("LLM_CHUNKER_SYSTEM_PROMPT"),
+                _runtime_setting_entry("LLM_ENHANCE_SYSTEM_PROMPT"),
+            ],
+        },
+        {
+            "id": "vector_db",
+            "title": "向量数据库配置",
+            "description": "PostgreSQL / pgvector 连接配置与默认知识库。数据库连接字段支持持久覆盖。",
+            "items": [
+                _static_setting_entry("PGVECTOR_ENABLED", lambda ctx: ctx.pgvector_cfg.get("enabled", False), source="config"),
+                _static_setting_entry("PGVECTOR_DEFAULT_KB_ID", lambda ctx: ctx.pgvector_cfg.get("default_kb_id", "default"), source="config"),
+                _static_setting_entry("DB_AVAILABLE", lambda ctx: is_db_available(), source="system"),
+                _runtime_setting_entry("DATABASE_URL"),
+                _runtime_setting_entry("PGVECTOR_HOST"),
+                _runtime_setting_entry("PGVECTOR_PORT"),
+                _runtime_setting_entry("PGVECTOR_DB"),
+                _runtime_setting_entry("PGVECTOR_USER"),
+                _runtime_setting_entry("PGVECTOR_PASSWORD"),
+            ],
+        },
+        {
+            "id": "storage",
+            "title": "存储配置",
+            "description": "OSS 上传、本地输出目录与解析结果存储配置。",
+            "items": [
+                _runtime_setting_entry("OSS_ACCESS_KEY_ID"),
+                _runtime_setting_entry("OSS_ACCESS_KEY_SECRET"),
+                _runtime_setting_entry("OSS_ENDPOINT"),
+                _runtime_setting_entry("OSS_BUCKET"),
+                _static_setting_entry("PARSER_OSS_PREFIX", lambda ctx: ctx.parser_oss_cfg.get("prefix", "mineru-uploads"), source="config"),
+                _static_setting_entry("PARSER_OSS_URL_EXPIRY", lambda ctx: ctx.parser_oss_cfg.get("url_expiry", 3600), source="config"),
+                _static_setting_entry("OUTPUT_DIR", lambda ctx: ctx.output_cfg.get("dir", "data/output"), source="config"),
+                _static_setting_entry("OUTPUT_ENCODING", lambda ctx: ctx.output_cfg.get("encoding", "utf-8-sig"), source="config"),
+            ],
+        },
+        {
+            "id": "about",
+            "title": "关于",
+            "description": "当前控制台展示的是代码、配置文件、环境变量与数据库覆盖层的聚合视图。",
+            "items": [
+                _static_setting_entry("PROJECT_NAME", "wisewe-rag-simple", source="system"),
+                _static_setting_entry("SETTINGS_GROUP_COUNT", 14, source="system"),
+                _static_setting_entry("CONFIG_FILE", "config.yaml", source="system"),
+                _static_setting_entry("SETTINGS_PRIORITY", "DB override > env > config > code", source="system"),
+                _static_setting_entry("PLANNING_WORKFLOW", "GSD + 共享账本", source="system"),
+                _static_setting_entry("TECH_STACK", "Python / Next.js / pgvector / MinerU", source="system"),
+            ],
+        },
+    ]
+
+
+def _build_settings_group(spec: dict[str, object], ctx: _SettingsBuildContext) -> dict[str, object]:
+    """
+    构建配置分组数据
+
+    参数：
+        spec: 配置分组规格
+        ctx: 配置构建上下文
+
+    返回：
+        dict: 配置分组数据
+    """
+    return {
+        "id": spec["id"],
+        "title": spec["title"],
+        "description": spec["description"],
+        "values": [factory(ctx) for factory in spec["items"]],
+    }
+
+
+def get_settings_group_summaries() -> list[dict[str, object]]:
+    """
+    获取配置分组摘要列表
+
+    返回所有配置分组的元信息，不包含具体配置项值。
+    用于配置管理页面的分组导航展示。
+
+    返回：
+        list[dict]: 配置分组摘要列表，每个摘要包含：
+            - id: 分组 ID
+            - title: 分组标题
+            - description: 分组描述
+            - count: 配置项数量
+
+    使用场景：
+        1. 配置管理页面的分组侧边栏展示
+        2. 快速查看各分组的配置项数量
+        3. 配置搜索时按分组筛选
+    """
+    return [
+        {
+            "id": spec["id"],
+            "title": spec["title"],
+            "description": spec["description"],
+            "count": len(spec["items"]),
+        }
+        for spec in _settings_group_specs()
+    ]
+
+
+def get_settings_group_payload(group_id: str) -> dict[str, object] | None:
+    """
+    获取指定配置分组的详细数据
+
+    根据分组 ID 返回该分组的完整配置项列表。
+
+    参数：
+        group_id: 配置分组 ID，如 "models_common"、"parser" 等
+
+    返回：
+        dict | None: 配置分组数据，包含：
+            - id: 分组 ID
+            - title: 分组标题
+            - description: 分组描述
+            - values: 配置项列表
+            如果分组不存在则返回 None
+
+    使用场景：
+        1. 分组配置页面的数据加载
+        2. 单个配置分组的详情展示
+        3. 配置编辑表单的数据源
+    """
+    spec = next((item for item in _settings_group_specs() if item["id"] == group_id), None)
+    if spec is None:
+        return None
+    return _build_settings_group(spec, _SettingsBuildContext())
+
+
 def get_settings_payload() -> list[dict]:
     """
     获取系统配置列表
@@ -270,6 +750,7 @@ def get_settings_payload() -> list[dict]:
         - models_quality: 质量审核模型
         - models_enhance: 三层增强模型
         - models_rag: 问答生成模型
+        - usage_cost: 用量与成本
         - identity_sso: 身份与 SSO
         - parser: 解析配置
         - chunking: 切片参数
@@ -277,281 +758,8 @@ def get_settings_payload() -> list[dict]:
         - storage: 存储配置
         - about: 关于
     """
-    config = load_config()
-    runtime_entries = {}
-    for key in EDITABLE_SETTINGS_KEYS:
-        value, source = resolve_runtime_setting(key, config=config)
-        sensitive = _is_sensitive_setting(key)
-        runtime_entries[key] = _entry(
-            key,
-            _mask_sensitive_value(value) if sensitive else value,
-            category=RUNTIME_SETTING_SPECS[key].category,
-            editable=True,
-            source=source,
-            sensitive=sensitive,
-            has_value=stringify_runtime_value(value) != "",
-        )
-
-    parser_cfg = config.get("parser", {})
-    parser_oss_cfg = parser_cfg.get("oss", {})
-    output_cfg = config.get("output", {})
-    pgvector_cfg = config.get("pgvector", {})
-
-    return [
-        {
-            "id": "models_common",
-            "title": "通用模型",
-            "description": "默认 LLM 服务地址与通用密钥，供未单独配置的清洗、切片、增强等功能复用。",
-            "values": [
-                runtime_entries["LLM_BASE_URL"],
-                runtime_entries["LLM_API_KEY"],
-            ],
-        },
-        {
-            "id": "models_embedding",
-            "title": "向量模型",
-            "description": "负责切片向量化与向量检索的 embedding 模型配置。",
-            "values": [
-                runtime_entries["LLM_EMBEDDING_MODEL"],
-                runtime_entries["LLM_EMBEDDING_BATCH_SIZE"],
-                runtime_entries["LLM_EMBEDDING_MAX_CONCURRENCY"],
-                runtime_entries["LLM_EMBEDDING_MAX_RETRIES"],
-                runtime_entries["LLM_EMBEDDING_API_KEY_POOL"],
-                runtime_entries["LLM_EMBEDDING_KEY_RETRIES"],
-                runtime_entries["LLM_EMBEDDING_KEY_COOLDOWN_SECONDS"],
-                runtime_entries["RAG_RETRIEVAL_SNAPSHOT"],
-            ],
-        },
-        {
-            "id": "models_cleaner",
-            "title": "清洗模型",
-            "description": "负责解析后文本清洗、噪声过滤与教材内容保留的模型和系统提示词。",
-            "values": [
-                runtime_entries["LLM_CLEANER_ENABLED"],
-                runtime_entries["LLM_CLEANER_MODEL"],
-                runtime_entries["LLM_CLEANER_BASE_URL"],
-                runtime_entries["LLM_CLEANER_API_KEY"],
-                runtime_entries["LLM_CLEANER_SYSTEM_PROMPT"],
-            ],
-        },
-        {
-            "id": "models_chunker",
-            "title": "切片模型",
-            "description": "负责 LLM 切片边界判断的系统提示词，强调知识点完整性与可引用粒度。",
-            "values": [
-                runtime_entries["LLM_CHUNKER_SYSTEM_PROMPT"],
-            ],
-        },
-        {
-            "id": "models_quality",
-            "title": "质量审核模型",
-            "description": "负责切片质量门控，避免过滤掉短图注、表格、公式和题目等有效教材证据。",
-            "values": [
-                runtime_entries["LLM_QUALITY_GATE_ENABLED"],
-                runtime_entries["LLM_QUALITY_GATE_MODEL"],
-                runtime_entries["LLM_QUALITY_GATE_BASE_URL"],
-                runtime_entries["LLM_QUALITY_GATE_API_KEY"],
-                runtime_entries["LLM_QUALITY_GATE_MIN_SCORE"],
-                runtime_entries["LLM_QUALITY_GATE_SYSTEM_PROMPT"],
-            ],
-        },
-        {
-            "id": "models_enhance",
-            "title": "三层增强模型",
-            "description": "负责 parent/child/enhanced 链路中的切片摘要、图片描述、表格摘要和结构化抽取提示词。",
-            "values": [
-                runtime_entries["LLM_ENHANCE_SYSTEM_PROMPT"],
-            ],
-        },
-        {
-            "id": "models_rag",
-            "title": "问答生成模型",
-            "description": "负责在线问答生成与引用约束。建议明确要求基于上下文回答，不足时直说无法可靠回答。",
-            "values": [
-                runtime_entries["RAG_LLM_MODEL"],
-                runtime_entries["RAG_LLM_BASE_URL"],
-                runtime_entries["RAG_LLM_API_KEY"],
-                runtime_entries["RAG_SYSTEM_PROMPT"],
-            ],
-        },
-        {
-            "id": "identity_sso",
-            "title": "身份与 SSO",
-            "description": "AI 基座身份接入、SSO 跳转与身份快照同步路径配置。支持服务端配置化管理接口前缀，避免硬编码。",
-            "values": [
-                runtime_entries["AI_BASE_SSO_BASE_URL"],
-                runtime_entries["AI_BASE_SSO_CLIENT_ID"],
-                runtime_entries["AI_BASE_SSO_CLIENT_SECRET"],
-                runtime_entries["AI_BASE_SSO_REDIRECT_URI"],
-                runtime_entries["AI_BASE_SSO_LAUNCH_BASE_URL"],
-                runtime_entries["AI_BASE_SSO_LAUNCH_PATH"],
-                runtime_entries["AI_BASE_SSO_EXCHANGE_PATH"],
-                runtime_entries["AI_BASE_SSO_USER_SNAPSHOT_PATH_TEMPLATE"],
-                runtime_entries["AI_BASE_SSO_DELTA_PATH"],
-                runtime_entries["KB_CONSOLE_BASE_URL"],
-                runtime_entries["KB_SESSION_TTL_SECONDS"],
-                runtime_entries["KB_LEGACY_HEADER_AUTH_ENABLED"],
-                runtime_entries["AI_BASE_IDENTITY_SYNC_ENABLED"],
-                runtime_entries["AI_BASE_IDENTITY_SYNC_INTERVAL_SECONDS"],
-                runtime_entries["AI_BASE_IDENTITY_SYNC_RUN_ON_STARTUP"],
-                runtime_entries["KB_IDENTITY_SNAPSHOT_MAX_AGE_SECONDS"],
-                runtime_entries["KB_CORS_ALLOW_ORIGINS"],
-                runtime_entries["KB_CORS_ALLOW_HEADERS"],
-            ],
-        },
-        {
-            "id": "parser",
-            "title": "解析配置",
-            "description": "MinerU 云解析关键参数与 302AI 接入配置。支持覆盖 parse_method、OCR、语言、模型版本等。",
-            "values": [
-                _entry("PARSER_MODE", parser_cfg.get("mode", "cloud"), source="config"),
-                runtime_entries["PDF_PARSER_PROVIDER"],
-                runtime_entries["PDF_PARSER_FALLBACKS"],
-                runtime_entries["parser.cloud.parse_method"],
-                runtime_entries["parser.cloud.version"],
-                runtime_entries["parser.cloud.timeout"],
-                runtime_entries["parser.cloud.poll_interval"],
-                runtime_entries["parser.cloud.enable_formula"],
-                runtime_entries["parser.cloud.enable_table_html"],
-                runtime_entries["parser.cloud.language"],
-                runtime_entries["parser.cloud.is_ocr"],
-                runtime_entries["parser.cloud.model_version"],
-                runtime_entries["parser.cloud.sharding.enabled"],
-                runtime_entries["parser.cloud.sharding.min_pages"],
-                runtime_entries["parser.cloud.sharding.min_file_mb"],
-                runtime_entries["parser.cloud.sharding.pages_per_shard"],
-                runtime_entries["parser.cloud.sharding.max_concurrency"],
-                runtime_entries["parser.cloud.sharding.text_sample_pages"],
-                runtime_entries["302AI_API_BASE"],
-                runtime_entries["302AI_API_KEY"],
-                runtime_entries["MINERU_OFFICIAL_API_BASE"],
-                runtime_entries["MINERU_OFFICIAL_API_TOKEN"],
-                runtime_entries["MINERU_OFFICIAL_MODEL_VERSION"],
-                runtime_entries["MINERU_OFFICIAL_TIMEOUT"],
-                runtime_entries["MINERU_OFFICIAL_POLL_INTERVAL"],
-                runtime_entries["MINERU_OFFICIAL_ENABLE_FORMULA"],
-                runtime_entries["MINERU_OFFICIAL_ENABLE_TABLE"],
-                runtime_entries["MINERU_OFFICIAL_LANGUAGE"],
-                runtime_entries["MINERU_OFFICIAL_IS_OCR"],
-                runtime_entries["MINERU_OFFICIAL_EXTRA_FORMATS"],
-                runtime_entries["MINERU_OFFICIAL_NO_CACHE"],
-                runtime_entries["MINERU_OFFICIAL_CACHE_TOLERANCE"],
-                runtime_entries["MINERU_OFFICIAL_SUBMIT_RETRY_ATTEMPTS"],
-                runtime_entries["MINERU_OFFICIAL_POLL_RETRY_ATTEMPTS"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_ENABLED"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_MIN_FILE_MB"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_MIN_PAGES"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_PAGES_PER_SHARD"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_MAX_CONCURRENCY"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_MAX_FILE_MB_PER_SHARD"],
-                runtime_entries["MINERU_OFFICIAL_SHARDING_TEXT_SAMPLE_PAGES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_ENDPOINT"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_OUTPUT_FORMAT"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_TIMEOUT"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_POLL_INTERVAL"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_ACCESS_KEY_ID"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_ACCESS_KEY_SECRET"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_CREDENTIAL_POOL"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_MAX_INFLIGHT_PER_KEY"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_KEY_RETRIES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_KEY_COOLDOWN_SECONDS"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_KEY_PROBE_CONCURRENCY"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_LLM_ENHANCEMENT"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_ENHANCEMENT_MODE"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_LAYOUT_STEP_SIZE"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_RESULT_FETCH_RETRIES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_EMPTY_RESULT_RETRIES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_EMPTY_RESULT_RETRY_DELAY"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_HEDGED_SHARD_ENABLED"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_HEDGE_AFTER_SECONDS"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_HEDGE_MAX_EXTRA_ATTEMPTS"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_ENABLED"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_MIN_FILE_MB"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_MIN_PAGES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_PAGES_PER_SHARD"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_MAX_CONCURRENCY"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_MIN_PAGES_PER_SHARD"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_TARGET_WAVES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARDING_TEXT_SAMPLE_PAGES"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_WEIGHTED_SHARDING_ENABLED"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_HEAVY_SHARD_FIRST"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARD_SAVE_GARBAGE"],
-                runtime_entries["ALIYUN_DOCUMENT_MIND_SHARD_SAVE_DEFLATE"],
-            ],
-        },
-        {
-            "id": "chunking",
-            "title": "切片参数",
-            "description": "展示当前切片策略的默认参数与提示词入口，便于核对运行时行为。",
-            "values": [
-                _entry("DEFAULT_INGESTION_STRATEGY", "hierarchical", source="code"),
-                _entry("FIXED_LENGTH_CHUNK_SIZE", 1000, source="code"),
-                _entry("FIXED_LENGTH_OVERLAP", 50, source="code"),
-                _entry("PARAGRAPH_MIN_CHARS", 64, source="code"),
-                _entry("PARAGRAPH_MAX_CHARS", 512, source="code"),
-                _entry("SEMANTIC_MAX_CHUNK_SIZE", 1000, source="code"),
-                _entry("LLM_MAX_CHUNK_SIZE", 800, source="code"),
-                _entry("HIERARCHICAL_CHILD_MAX_CHARS", 600, source="code"),
-                runtime_entries["INGESTION_READY_MODE"],
-                runtime_entries["HIERARCHICAL_ENHANCE_MODE"],
-                runtime_entries["HIERARCHICAL_TEXT_ENHANCE_WORKERS"],
-                runtime_entries["HIERARCHICAL_TABLE_ENHANCE_WORKERS"],
-                runtime_entries["HIERARCHICAL_IMAGE_ENHANCE_WORKERS"],
-                runtime_entries["HIERARCHICAL_ENHANCE_MAX_CONCURRENCY"],
-                runtime_entries["HIERARCHICAL_REUSE_LLM_CLIENTS"],
-                runtime_entries["LLM_API_KEY_POOL"],
-                runtime_entries["VL_API_KEY_POOL"],
-                runtime_entries["HIERARCHICAL_ENHANCE_KEY_RETRIES"],
-                runtime_entries["HIERARCHICAL_KEY_COOLDOWN_SECONDS"],
-                runtime_entries["LLM_CHUNKER_SYSTEM_PROMPT"],
-                runtime_entries["LLM_ENHANCE_SYSTEM_PROMPT"],
-            ],
-        },
-        {
-            "id": "vector_db",
-            "title": "向量数据库配置",
-            "description": "PostgreSQL / pgvector 连接配置与默认知识库。数据库连接字段支持持久覆盖。",
-            "values": [
-                _entry("PGVECTOR_ENABLED", pgvector_cfg.get("enabled", False), source="config"),
-                _entry("PGVECTOR_DEFAULT_KB_ID", pgvector_cfg.get("default_kb_id", "default"), source="config"),
-                _entry("DB_AVAILABLE", is_db_available(), source="system"),
-                runtime_entries["DATABASE_URL"],
-                runtime_entries["PGVECTOR_HOST"],
-                runtime_entries["PGVECTOR_PORT"],
-                runtime_entries["PGVECTOR_DB"],
-                runtime_entries["PGVECTOR_USER"],
-                runtime_entries["PGVECTOR_PASSWORD"],
-            ],
-        },
-        {
-            "id": "storage",
-            "title": "存储配置",
-            "description": "OSS 上传、本地输出目录与解析结果存储配置。",
-            "values": [
-                runtime_entries["OSS_ACCESS_KEY_ID"],
-                runtime_entries["OSS_ACCESS_KEY_SECRET"],
-                runtime_entries["OSS_ENDPOINT"],
-                runtime_entries["OSS_BUCKET"],
-                _entry("PARSER_OSS_PREFIX", parser_oss_cfg.get("prefix", "mineru-uploads"), source="config"),
-                _entry("PARSER_OSS_URL_EXPIRY", parser_oss_cfg.get("url_expiry", 3600), source="config"),
-                _entry("OUTPUT_DIR", output_cfg.get("dir", "data/output"), source="config"),
-                _entry("OUTPUT_ENCODING", output_cfg.get("encoding", "utf-8-sig"), source="config"),
-            ],
-        },
-        {
-            "id": "about",
-            "title": "关于",
-            "description": "当前控制台展示的是代码、配置文件、环境变量与数据库覆盖层的聚合视图。",
-            "values": [
-                _entry("PROJECT_NAME", "wisewe-rag-simple", source="system"),
-                _entry("SETTINGS_GROUP_COUNT", 13, source="system"),
-                _entry("CONFIG_FILE", "config.yaml", source="system"),
-                _entry("SETTINGS_PRIORITY", "DB override > env > config > code", source="system"),
-                _entry("PLANNING_WORKFLOW", "GSD + 共享账本", source="system"),
-                _entry("TECH_STACK", "Python / Next.js / pgvector / MinerU", source="system"),
-            ],
-        },
-    ]
+    ctx = _SettingsBuildContext()
+    return [_build_settings_group(spec, ctx) for spec in _settings_group_specs()]
 
 
 def update_console_settings(payload: dict[str, str], updated_by: str = "console") -> dict[str, object]:
@@ -745,7 +953,8 @@ def get_console_alerts() -> list[dict]:
             }
         )
 
-    if not resolve_runtime_setting("LLM_API_KEY")[0] and not resolve_runtime_setting("RAG_LLM_API_KEY")[0]:
+    rag_llm_enabled = bool(resolve_runtime_setting("RAG_LLM_ENABLED")[0])
+    if not resolve_runtime_setting("LLM_API_KEY")[0] and rag_llm_enabled and not resolve_runtime_setting("RAG_LLM_API_KEY")[0]:
         alerts.append(
             {
                 "id": "alert-llm-key-missing",
@@ -950,8 +1159,67 @@ def get_console_audit_logs(
     return _filter_records_by_visible_kbs(records, identity)
 
 
-def get_console_identity_sync_logs(limit: int = 100, identity: IdentityContext | None = None) -> list[dict]:
-    return list_identity_sync_runs(limit=limit)
+def get_console_identity_sync_logs(
+    *,
+    source_id: str,
+    limit: int = 100,
+    identity: IdentityContext | None = None,
+) -> list[dict]:
+    """
+    获取身份同步日志列表
+
+    查询指定外部身份源的身份同步执行记录。
+
+    参数：
+        source_id: 外部身份源 ID
+        limit: 返回数量限制，默认 100 条
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: 身份同步日志列表
+    """
+    return list_identity_sync_runs(source_id=source_id, limit=limit)
+
+
+def get_console_external_identity_sources(
+    *,
+    login_only: bool = False,
+    identity: IdentityContext | None = None,
+) -> dict:
+    """
+    获取外部身份源列表
+
+    返回所有外部身份源配置，主要用于 SSO 登录和身份同步场景。
+    支持按用途筛选（仅登录或全部）。
+
+    参数：
+        login_only: 是否仅返回用于登录的身份源
+            - True: 仅返回 enable_login=True 的身份源
+            - False: 返回所有身份源
+        identity: 用户身份上下文，用于权限校验和数据范围过滤
+
+    返回：
+        dict: 外部身份源数据，包含：
+            - sources: 身份源列表，每个身份源包含：
+                - id: 身份源 ID
+                - sourceName: 身份源名称
+                - ssoBaseUrl: SSO 服务基础 URL
+                - ssoClientId: SSO 客户端 ID
+                - enableLogin: 是否启用登录
+                - enableSync: 是否启用同步
+                - status: 状态（active / disabled）
+
+    使用场景：
+        1. SSO 登录页面：展示可用的登录方式列表（login_only=True）
+        2. 身份源管理页面：展示所有身份源配置（login_only=False）
+        3. 身份同步配置：查看可同步的身份源
+
+    注意事项：
+        - login_only=True 时不需要管理员权限，任何用户都可以访问
+        - login_only=False 时需要平台管理员或租户管理员权限
+    """
+    _assert_external_system_config_manager(identity) if not login_only else None
+    return list_external_identity_sources(login_only=login_only, identity=identity)
 
 
 def get_console_ingestion_tasks(
@@ -964,6 +1232,28 @@ def get_console_ingestion_tasks(
     page_size: int = 20,
     identity: IdentityContext | None = None,
 ) -> dict:
+    """
+    获取入库任务列表
+
+    查询入库任务列表，支持多种筛选条件和分页。
+
+    参数：
+        keyword: 关键词搜索（匹配 ID、文件名、知识库名称等）
+        task_id: 任务 ID 筛选
+        status: 状态筛选
+        strategy: 切片策略筛选
+        page: 页码，从 1 开始
+        page_size: 每页数量，默认 20，最大 100
+        identity: 用户身份上下文
+
+    返回：
+        dict: 分页结果，包含：
+            - items: 任务列表
+            - total: 总数量
+            - page: 当前页码
+            - pageSize: 每页数量
+            - pageCount: 总页数
+    """
     kb_items = get_knowledge_bases_payload(identity)
     kb_by_id = {str(item["id"]): item for item in kb_items}
     normalized_keyword = (keyword or "").strip().lower()
@@ -1016,6 +1306,24 @@ def get_latest_ingestion_log(
     max_lines: int = 500,
     identity: IdentityContext | None = None,
 ) -> dict:
+    """
+    获取最新的入库任务日志
+
+    查询指定知识库或全局的最新入库任务日志内容。
+
+    参数：
+        kb_id: 知识库 ID，不传则查询全局最新任务
+        max_lines: 最大返回行数，默认 500，最大 2000
+        identity: 用户身份上下文
+
+    返回：
+        dict: 日志数据，包含：
+            - task: 任务信息
+            - lines: 日志行列表
+            - lineCount: 日志总行数
+            - truncated: 是否被截断
+            - logPath: 日志文件路径
+    """
     kb_items = get_knowledge_bases_payload(identity)
     kb_by_id = {str(item["id"]): item for item in kb_items}
     tasks = filter_tasks_by_identity(get_all_tasks(), identity or IdentityContext())
@@ -1408,6 +1716,21 @@ def get_console_token_usage(
     identity: IdentityContext | None = None,
     pipeline_domain: str | None = None,
 ) -> dict:
+    """
+    获取 Token 使用统计摘要
+
+    返回 Token 使用统计摘要，包括各维度的汇总数据。
+    每次调用会刷新处理成本预估。
+
+    参数：
+        limit: 返回结果数量限制，默认 10
+        identity: 用户身份上下文
+        pipeline_domain: 管道域筛选
+
+    返回：
+        dict: Token 使用统计数据
+    """
+    refresh_processing_cost_estimates()
     return fetch_token_usage_summary_for_identity(
         limit=limit,
         tenant_id=identity.tenant_id if identity and identity.enforce_access else None,
@@ -1496,7 +1819,312 @@ def get_console_app_usage(
     )
 
 
+def get_console_token_usage_tasks(
+    *,
+    limit: int = 20,
+    identity: IdentityContext | None = None,
+    task_id: str | None = None,
+    kb_id: str | None = None,
+    document_id: str | None = None,
+    pipeline_domain: str | None = None,
+    pipeline_stage: str | None = None,
+    event_type: str | None = None,
+    provider: str | None = None,
+    model_name: str | None = None,
+    api_key_id: str | None = None,
+    app_id: str | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> dict:
+    """
+    获取按任务维度的 Token 使用统计
+
+    返回按入库任务聚合的 Token 使用统计，用于分析单个任务的资源消耗。
+    支持多种筛选条件，包括任务 ID、知识库、文档、管道域等。
+
+    参数：
+        limit: 返回结果数量限制，默认 20
+        identity: 用户身份上下文，用于权限校验和数据范围过滤
+        task_id: 任务 ID 筛选
+        kb_id: 知识库 ID 筛选
+        document_id: 文档 ID 筛选
+        pipeline_domain: 管道域筛选（rag/embedding/chunking 等）
+        pipeline_stage: 管道阶段筛选（parse/clean/chunk/enhance 等）
+        event_type: 事件类型筛选
+        provider: 模型提供商筛选（openai/dashscope 等）
+        model_name: 模型名称筛选
+        api_key_id: API Key ID 筛选
+        app_id: 应用 ID 筛选
+        start_at: 统计开始时间
+        end_at: 统计结束时间
+
+    返回：
+        dict: 按任务聚合的 Token 使用统计
+
+    使用场景：
+        1. 任务成本分析：查看单个入库任务的 Token 消耗
+        2. 资源规划：分析历史任务的资源使用模式
+        3. 异常排查：定位高消耗任务
+    """
+    scope = _token_cost_scope(identity)
+    refresh_processing_cost_estimates()
+    return fetch_processing_cost_tasks_for_identity(
+        limit=limit,
+        tenant_id=scope["tenant_id"],
+        include_all_tenants=scope["include_all_tenants"],
+        visible_kb_ids=scope["visible_kb_ids"],
+        task_id=task_id,
+        kb_id=kb_id,
+        document_id=document_id,
+        pipeline_domain=pipeline_domain,
+        pipeline_stage=pipeline_stage,
+        event_type=event_type,
+        provider=provider,
+        model_name=model_name,
+        api_key_id=api_key_id,
+        app_id=app_id,
+        start_at=start_at,
+        end_at=end_at,
+    )
+
+
+def get_console_token_usage_task_detail(
+    task_id: str,
+    *,
+    identity: IdentityContext | None = None,
+    limit: int = 100,
+) -> dict:
+    """
+    获取指定任务的 Token 使用详情
+
+    返回单个任务的详细 Token 使用记录，包括每个事件的具体消耗。
+
+    参数：
+        task_id: 任务 ID
+        identity: 用户身份上下文
+        limit: 返回记录数量限制，默认 100
+
+    返回：
+        dict: 任务 Token 使用详情，包含事件列表和汇总统计
+    """
+    scope = _token_cost_scope(identity)
+    refresh_processing_cost_estimates()
+    return fetch_processing_cost_task_detail_for_identity(
+        task_id,
+        tenant_id=scope["tenant_id"],
+        include_all_tenants=scope["include_all_tenants"],
+        visible_kb_ids=scope["visible_kb_ids"],
+        limit=limit,
+    )
+
+
+def get_console_token_usage_documents(
+    *,
+    limit: int = 20,
+    identity: IdentityContext | None = None,
+    document_id: str | None = None,
+    kb_id: str | None = None,
+    pipeline_domain: str | None = None,
+    pipeline_stage: str | None = None,
+    event_type: str | None = None,
+    provider: str | None = None,
+    model_name: str | None = None,
+    api_key_id: str | None = None,
+    app_id: str | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> dict:
+    """
+    获取按文档维度的 Token 使用统计
+
+    返回按文档聚合的 Token 使用统计，用于分析单个文档的资源消耗。
+
+    参数：
+        limit: 返回结果数量限制，默认 20
+        identity: 用户身份上下文
+        document_id: 文档 ID 筛选
+        kb_id: 知识库 ID 筛选
+        pipeline_domain: 管道域筛选
+        pipeline_stage: 管道阶段筛选
+        event_type: 事件类型筛选
+        provider: 模型提供商筛选
+        model_name: 模型名称筛选
+        api_key_id: API Key ID 筛选
+        app_id: 应用 ID 筛选
+        start_at: 统计开始时间
+        end_at: 统计结束时间
+
+    返回：
+        dict: 按文档聚合的 Token 使用统计
+
+    使用场景：
+        1. 文档成本分析：查看单个文档的 Token 消耗
+        2. 大文档优化：识别消耗异常的大文档
+    """
+    scope = _token_cost_scope(identity)
+    refresh_processing_cost_estimates()
+    return fetch_processing_cost_documents_for_identity(
+        limit=limit,
+        tenant_id=scope["tenant_id"],
+        include_all_tenants=scope["include_all_tenants"],
+        visible_kb_ids=scope["visible_kb_ids"],
+        document_id=document_id,
+        kb_id=kb_id,
+        pipeline_domain=pipeline_domain,
+        pipeline_stage=pipeline_stage,
+        event_type=event_type,
+        provider=provider,
+        model_name=model_name,
+        api_key_id=api_key_id,
+        app_id=app_id,
+        start_at=start_at,
+        end_at=end_at,
+    )
+
+
+def get_console_project_cost_estimates(
+    *,
+    limit: int = 20,
+    identity: IdentityContext | None = None,
+    task_id: str | None = None,
+    kb_id: str | None = None,
+    document_id: str | None = None,
+    pipeline_domain: str | None = None,
+    pipeline_stage: str | None = None,
+    event_type: str | None = None,
+    provider: str | None = None,
+    cost_source: str | None = None,
+    api_key_id: str | None = None,
+    app_id: str | None = None,
+    start_at: datetime | None = None,
+    end_at: datetime | None = None,
+) -> dict:
+    """
+    获取项目成本预估统计
+
+    返回按项目（任务/文档）聚合的成本预估数据，用于成本分析和预算管理。
+    成本预估基于配置的费率参数计算。
+
+    参数：
+        limit: 返回结果数量限制，默认 20
+        identity: 用户身份上下文
+        task_id: 任务 ID 筛选
+        kb_id: 知识库 ID 筛选
+        document_id: 文档 ID 筛选
+        pipeline_domain: 管道域筛选
+        pipeline_stage: 管道阶段筛选
+        event_type: 事件类型筛选
+        provider: 模型提供商筛选
+        cost_source: 成本来源筛选（token/oss/parser 等）
+        api_key_id: API Key ID 筛选
+        app_id: 应用 ID 筛选
+        start_at: 统计开始时间
+        end_at: 统计结束时间
+
+    返回：
+        dict: 项目成本预估统计，包含：
+            - items: 成本预估列表
+            - summary: 汇总成本
+
+    使用场景：
+        1. 成本核算：计算项目级别的资源成本
+        2. 预算管理：预估未来资源消耗
+        3. 成本优化：识别高成本操作
+    """
+    scope = _token_cost_scope(identity)
+    refresh_processing_cost_estimates()
+    return fetch_project_cost_estimates_for_identity(
+        limit=limit,
+        tenant_id=scope["tenant_id"],
+        include_all_tenants=scope["include_all_tenants"],
+        visible_kb_ids=scope["visible_kb_ids"],
+        task_id=task_id,
+        kb_id=kb_id,
+        document_id=document_id,
+        pipeline_domain=pipeline_domain,
+        pipeline_stage=pipeline_stage,
+        event_type=event_type,
+        provider=provider,
+        cost_source=cost_source,
+        api_key_id=api_key_id,
+        app_id=app_id,
+        start_at=start_at,
+        end_at=end_at,
+    )
+
+
+def get_console_token_usage_document_detail(
+    document_id: str,
+    *,
+    identity: IdentityContext | None = None,
+    limit: int = 100,
+) -> dict:
+    """
+    获取指定文档的 Token 使用详情
+
+    返回单个文档的详细 Token 使用记录，包括每个事件的具体消耗。
+
+    参数：
+        document_id: 文档 ID
+        identity: 用户身份上下文
+        limit: 返回记录数量限制，默认 100
+
+    返回：
+        dict: 文档 Token 使用详情，包含事件列表和汇总统计
+    """
+    scope = _token_cost_scope(identity)
+    refresh_processing_cost_estimates()
+    return fetch_processing_cost_document_detail_for_identity(
+        document_id,
+        tenant_id=scope["tenant_id"],
+        include_all_tenants=scope["include_all_tenants"],
+        visible_kb_ids=scope["visible_kb_ids"],
+        limit=limit,
+    )
+
+
+def _token_cost_scope(identity: IdentityContext | None) -> dict[str, object]:
+    """
+    计算 Token 成本查询的数据范围
+
+    根据用户身份确定查询的数据范围，用于权限控制和数据过滤。
+
+    参数：
+        identity: 用户身份上下文
+
+    返回：
+        dict: 数据范围信息，包含：
+            - tenant_id: 租户 ID（无身份时为 None）
+            - include_all_tenants: 是否包含所有租户（平台管理员为 True）
+            - visible_kb_ids: 可见知识库 ID 列表（非管理员时有效）
+    """
+    if not identity or not identity.enforce_access:
+        return {"tenant_id": None, "include_all_tenants": False, "visible_kb_ids": None}
+    if identity.is_platform_admin:
+        return {"tenant_id": identity.tenant_id, "include_all_tenants": True, "visible_kb_ids": None}
+    if identity.is_tenant_admin:
+        return {"tenant_id": identity.tenant_id, "include_all_tenants": False, "visible_kb_ids": None}
+    visible = [str(item["id"]) for item in get_knowledge_bases_payload(identity)]
+    return {
+        "tenant_id": identity.tenant_id,
+        "include_all_tenants": False,
+        "visible_kb_ids": visible or ["__no_visible_kb__"],
+    }
+
+
 def _filter_records_by_visible_kbs(records: list[dict], identity: IdentityContext | None = None) -> list[dict]:
+    """
+    按可见知识库过滤记录
+
+    根据用户身份过滤记录，确保用户只能看到有权限的知识库相关数据。
+
+    参数：
+        records: 原始记录列表
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: 过滤后的记录列表
+    """
     if not identity or not identity.enforce_access or identity.is_tenant_admin or identity.is_platform_admin:
         return records
     visible_kb_ids = {str(item["id"]) for item in get_knowledge_bases_payload(identity)}
@@ -1516,6 +2144,27 @@ def export_console_query_logs(
     limit: int = 10000,
     identity: IdentityContext | None = None,
 ) -> tuple[str, bytes]:
+    """
+    导出 RAG 查询日志为 CSV 文件
+
+    支持多种筛选条件导出查询日志，用于离线分析和审计。
+    操作会记录中等风控级别的审计日志。
+
+    参数：
+        tenant_id: 租户 ID 筛选
+        kb_id: 知识库 ID 筛选
+        request_id: 请求 ID 筛选
+        actor_id: 操作者 ID 筛选
+        api_key_id: API Key ID 筛选
+        pipeline_domain: 管道域筛选
+        start_at: 开始时间
+        end_at: 结束时间
+        limit: 导出记录数量限制，默认 10000
+        identity: 用户身份上下文
+
+    返回：
+        tuple[str, bytes]: CSV 文件名和文件内容
+    """
     result = export_rag_query_logs_csv(
         tenant_id=tenant_id,
         kb_id=kb_id,
@@ -1555,203 +2204,37 @@ def export_console_query_logs(
 
 
 def get_console_api_keys(identity: IdentityContext | None = None) -> list[dict]:
+    """
+    获取 API Key 列表
+
+    返回当前用户有权限访问的 API Key 列表。
+    需要租户管理员或平台管理员权限。
+
+    参数：
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: API Key 列表
+    """
     _assert_api_key_manager(identity)
     return list_api_keys(identity)
 
 
 def get_console_openapi_apps(identity: IdentityContext | None = None) -> list[dict]:
+    """
+    获取 OpenAPI 应用列表
+
+    返回当前用户有权限访问的 OpenAPI 应用列表。
+    需要租户管理员或平台管理员权限。
+
+    参数：
+        identity: 用户身份上下文
+
+    返回：
+        list[dict]: OpenAPI 应用列表
+    """
     _assert_api_key_manager(identity)
     return list_openapi_apps(identity)
-
-
-def create_console_openapi_app(payload: dict, identity: IdentityContext | None = None) -> dict:
-    _assert_api_key_manager(identity)
-    result = create_openapi_app(
-        name=str(payload.get("name") or ""),
-        note=str(payload.get("note") or ""),
-        identity=identity,
-    )
-    append_audit_log(
-        AuditLogRecord(
-            action="openapi_app.create",
-            resource_type="openapi_app",
-            resource_id=result.get("id"),
-            identity=identity,
-            outcome="success",
-            risk_level="medium",
-            summary=f"Created OpenAPI app {result.get('id')}",
-            metadata={"name": result.get("name"), "note": result.get("note")},
-        )
-    )
-    return result
-
-
-def update_console_openapi_app(app_id: str, payload: dict, identity: IdentityContext | None = None) -> dict | None:
-    _assert_api_key_manager(identity)
-    result = update_openapi_app(
-        app_id,
-        name=payload.get("name") if "name" in payload else None,
-        status=payload.get("status") if "status" in payload else None,
-        note=payload.get("note") if "note" in payload else None,
-        identity=identity,
-    )
-    if result:
-        append_audit_log(
-            AuditLogRecord(
-                action="openapi_app.update",
-                resource_type="openapi_app",
-                resource_id=app_id,
-                identity=identity,
-                outcome="success",
-                risk_level="medium",
-                summary=f"Updated OpenAPI app {app_id}",
-                metadata={"changedFields": sorted(payload.keys())},
-            )
-        )
-    return result
-
-
-def delete_console_openapi_app(app_id: str, identity: IdentityContext | None = None) -> bool:
-    _assert_api_key_manager(identity)
-    deleted = delete_openapi_app(app_id, identity)
-    if deleted:
-        append_audit_log(
-            AuditLogRecord(
-                action="openapi_app.delete",
-                resource_type="openapi_app",
-                resource_id=app_id,
-                identity=identity,
-                outcome="success",
-                risk_level="medium",
-                summary=f"Deleted OpenAPI app {app_id}",
-            )
-        )
-    return deleted
-
-
-def create_console_api_key(payload: dict, identity: IdentityContext | None = None) -> dict:
-    _assert_api_key_manager(identity)
-    result = create_api_key(
-        name=str(payload.get("name") or ""),
-        kb_ids=list(payload.get("kbIds") or []),
-        capabilities=list(payload.get("capabilities") or []),
-        require_signature=bool(payload.get("requireSignature", True)),
-        allowed_ips=list(payload.get("allowedIps") or []),
-        rpm_limit=int(payload.get("rpmLimit") or 0),
-        daily_request_limit=int(payload.get("dailyRequestLimit") or 0),
-        app_id=payload.get("appId"),
-        note=str(payload.get("note") or ""),
-        expires_at=payload.get("expiresAt"),
-        identity=identity,
-    )
-    append_audit_log(
-        AuditLogRecord(
-            action="api_key.create",
-            resource_type="api_key",
-            resource_id=result.get("id"),
-            api_key_id=result.get("id"),
-            identity=identity,
-            outcome="success",
-            risk_level="high",
-            summary=f"Created API Key {result.get('id')}",
-            metadata={
-                "name": result.get("name"),
-                "kbIds": result.get("kbIds", []),
-                "capabilities": result.get("capabilities", []),
-                "requireSignature": result.get("requireSignature"),
-                "allowedIps": result.get("allowedIps", []),
-                "rpmLimit": result.get("rpmLimit"),
-                "dailyRequestLimit": result.get("dailyRequestLimit"),
-                "appId": result.get("appId"),
-                "expiresAt": result.get("expiresAt"),
-            },
-        )
-    )
-    return result
-
-
-def update_console_api_key(key_id: str, payload: dict, identity: IdentityContext | None = None) -> dict | None:
-    _assert_api_key_manager(identity)
-    result = update_api_key(
-        key_id,
-        name=payload.get("name") if "name" in payload else None,
-        status=payload.get("status") if "status" in payload else None,
-        kb_ids=list(payload.get("kbIds")) if "kbIds" in payload and payload.get("kbIds") is not None else None,
-        capabilities=(
-            list(payload.get("capabilities"))
-            if "capabilities" in payload and payload.get("capabilities") is not None
-            else None
-        ),
-        require_signature=payload.get("requireSignature") if "requireSignature" in payload else None,
-        allowed_ips=list(payload.get("allowedIps")) if "allowedIps" in payload and payload.get("allowedIps") is not None else None,
-        rpm_limit=payload.get("rpmLimit") if "rpmLimit" in payload else None,
-        daily_request_limit=payload.get("dailyRequestLimit") if "dailyRequestLimit" in payload else None,
-        app_id=payload.get("appId") if "appId" in payload else None,
-        app_id_provided="appId" in payload,
-        note=payload.get("note") if "note" in payload else None,
-        expires_at=payload.get("expiresAt") if "expiresAt" in payload else None,
-        expires_at_provided="expiresAt" in payload,
-        identity=identity,
-    )
-    if result:
-        append_audit_log(
-            AuditLogRecord(
-                action="api_key.update",
-                resource_type="api_key",
-                resource_id=key_id,
-                api_key_id=key_id,
-                identity=identity,
-                outcome="success",
-                risk_level="high" if payload.get("status") == "disabled" else "medium",
-                summary=f"Updated API Key {key_id}",
-                metadata={"changedFields": sorted(payload.keys())},
-            )
-        )
-    return result
-
-
-def rotate_console_api_key(key_id: str, identity: IdentityContext | None = None) -> dict | None:
-    _assert_api_key_manager(identity)
-    result = rotate_api_key(key_id, identity)
-    if result:
-        append_audit_log(
-            AuditLogRecord(
-                action="api_key.rotate",
-                resource_type="api_key",
-                resource_id=key_id,
-                api_key_id=key_id,
-                identity=identity,
-                outcome="success",
-                risk_level="high",
-                summary=f"Rotated API Key {key_id}",
-                metadata={"keyPrefix": result.get("keyPrefix"), "keySuffix": result.get("keySuffix")},
-            )
-        )
-    return result
-
-
-def delete_console_api_key(key_id: str, identity: IdentityContext | None = None) -> bool:
-    _assert_api_key_manager(identity)
-    deleted = delete_api_key(key_id, identity)
-    if deleted:
-        append_audit_log(
-            AuditLogRecord(
-                action="api_key.delete",
-                resource_type="api_key",
-                resource_id=key_id,
-                api_key_id=key_id,
-                identity=identity,
-                outcome="success",
-                risk_level="high",
-                summary=f"Deleted API Key {key_id}",
-            )
-        )
-    return deleted
-
-
-def _assert_api_key_manager(identity: IdentityContext | None) -> None:
-    if identity and identity.enforce_access and not (identity.is_tenant_admin or identity.is_platform_admin):
-        raise PermissionError("Only tenant or platform administrators can manage API Keys")
 
 
 def get_console_external_system_configs(identity: IdentityContext | None = None) -> list[dict]:
@@ -1808,6 +2291,7 @@ def create_console_external_system_config(payload: dict, identity: IdentityConte
 
     参数：
         payload: 配置数据字典，包含：
+            - sourceName: str（必填）- 身份源名称
             - ssoBaseUrl: str（必填）- SSO 服务基础 URL，如 "https://sso.example.com"
             - ssoClientId: str（必填）- SSO 客户端 ID，从 SSO 平台获取
             - ssoClientSecret: str（必填）- SSO 客户端密钥，从 SSO 平台获取
@@ -1846,6 +2330,7 @@ def create_console_external_system_config(payload: dict, identity: IdentityConte
     """
     _assert_external_system_config_manager(identity)
     result = create_external_system_config(
+        source_name=_required_external_config_text(payload.get("sourceName"), "sourceName"),
         sso_base_url=_required_external_config_text(payload.get("ssoBaseUrl"), "ssoBaseUrl"),
         sso_client_id=_required_external_config_text(payload.get("ssoClientId"), "ssoClientId"),
         sso_client_secret=_required_external_config_text(payload.get("ssoClientSecret"), "ssoClientSecret"),
@@ -1877,6 +2362,8 @@ def create_console_external_system_config(payload: dict, identity: IdentityConte
             risk_level="high",
             summary=f"Created external system config {result.get('id')}",
             metadata={
+                "sourceId": result.get("sourceId"),
+                "sourceName": result.get("sourceName"),
                 "ssoBaseUrl": result.get("ssoBaseUrl"),
                 "ssoClientId": result.get("ssoClientId"),
                 "ssoRedirectUri": result.get("ssoRedirectUri"),
@@ -1903,6 +2390,7 @@ def update_console_external_system_config(config_id: str, payload: dict, identit
     参数：
         config_id: 配置 ID，必须是有效的外部系统配置 ID。
         payload: 更新数据字典，支持的字段（均为可选）：
+            - sourceName: str - 身份源名称
             - ssoBaseUrl: str - SSO 服务基础 URL
             - ssoClientId: str - SSO 客户端 ID
             - ssoClientSecret: str - SSO 客户端密钥（暂不支持通过此接口更新）
@@ -1937,6 +2425,11 @@ def update_console_external_system_config(config_id: str, payload: dict, identit
         - 更新操作会触发审计日志，禁用配置时风险级别为 high
     """
     _assert_external_system_config_manager(identity)
+    source_name = (
+        _required_external_config_text(payload.get("sourceName"), "sourceName")
+        if "sourceName" in payload
+        else None
+    )
     sso_base_url = (
         _required_external_config_text(payload.get("ssoBaseUrl"), "ssoBaseUrl")
         if "ssoBaseUrl" in payload
@@ -1977,6 +2470,7 @@ def update_console_external_system_config(config_id: str, payload: dict, identit
 
     result = update_external_system_config(
         config_id,
+        source_name=source_name,
         sso_base_url=sso_base_url,
         sso_client_id=sso_client_id,
         sso_redirect_uri=sso_redirect_uri,
@@ -2055,16 +2549,358 @@ def delete_console_external_system_config(config_id: str, identity: IdentityCont
     return deleted
 
 
+def create_console_openapi_app(payload: dict, identity: IdentityContext | None = None) -> dict:
+    """
+    创建 OpenAPI 应用
+
+    创建新的 OpenAPI 应用记录，用于 API 管理和访问控制。
+    操作会记录中等风控级别的审计日志。
+
+    参数：
+        payload: 应用数据字典，包含：
+            - name: str - 应用名称
+            - note: str - 应用说明
+        identity: 用户身份上下文
+
+    返回：
+        dict: 创建的应用记录
+    """
+    _assert_api_key_manager(identity)
+    result = create_openapi_app(
+        name=str(payload.get("name") or ""),
+        note=str(payload.get("note") or ""),
+        identity=identity,
+    )
+    append_audit_log(
+        AuditLogRecord(
+            action="openapi_app.create",
+            resource_type="openapi_app",
+            resource_id=result.get("id"),
+            identity=identity,
+            outcome="success",
+            risk_level="medium",
+            summary=f"Created OpenAPI app {result.get('id')}",
+            metadata={"name": result.get("name"), "note": result.get("note")},
+        )
+    )
+    return result
+
+
+def update_console_openapi_app(app_id: str, payload: dict, identity: IdentityContext | None = None) -> dict | None:
+    """
+    更新 OpenAPI 应用
+
+    更新指定的 OpenAPI 应用记录，支持部分字段更新。
+    操作会记录中等风控级别的审计日志。
+
+    参数：
+        app_id: 应用 ID
+        payload: 更新数据字典，支持的字段：
+            - name: str - 应用名称
+            - status: str - 应用状态
+            - note: str - 应用说明
+        identity: 用户身份上下文
+
+    返回：
+        dict | None: 更新后的应用记录，不存在时返回 None
+    """
+    _assert_api_key_manager(identity)
+    result = update_openapi_app(
+        app_id,
+        name=payload.get("name") if "name" in payload else None,
+        status=payload.get("status") if "status" in payload else None,
+        note=payload.get("note") if "note" in payload else None,
+        identity=identity,
+    )
+    if result:
+        append_audit_log(
+            AuditLogRecord(
+                action="openapi_app.update",
+                resource_type="openapi_app",
+                resource_id=app_id,
+                identity=identity,
+                outcome="success",
+                risk_level="medium",
+                summary=f"Updated OpenAPI app {app_id}",
+                metadata={"changedFields": sorted(payload.keys())},
+            )
+        )
+    return result
+
+
+def delete_console_openapi_app(app_id: str, identity: IdentityContext | None = None) -> bool:
+    """
+    删除 OpenAPI 应用
+
+    删除指定的 OpenAPI 应用记录。操作会记录中等风控级别的审计日志。
+
+    参数：
+        app_id: 应用 ID
+        identity: 用户身份上下文
+
+    返回：
+        bool: 是否成功删除
+    """
+    _assert_api_key_manager(identity)
+    deleted = delete_openapi_app(app_id, identity)
+    if deleted:
+        append_audit_log(
+            AuditLogRecord(
+                action="openapi_app.delete",
+                resource_type="openapi_app",
+                resource_id=app_id,
+                identity=identity,
+                outcome="success",
+                risk_level="medium",
+                summary=f"Deleted OpenAPI app {app_id}",
+            )
+        )
+    return deleted
+
+
+def create_console_api_key(payload: dict, identity: IdentityContext | None = None) -> dict:
+    """
+    创建 API Key
+
+    创建新的 API Key 记录，用于 API 访问认证和权限控制。
+    操作会记录高风控级别的审计日志。
+
+    参数：
+        payload: API Key 数据字典，包含：
+            - name: str - API Key 名称
+            - kbIds: list - 关联知识库 ID 列表
+            - capabilities: list - 权限列表
+            - requireSignature: bool - 是否需要签名验证
+            - allowedIps: list - 允许的 IP 列表
+            - rpmLimit: int - 每分钟请求限制
+            - dailyRequestLimit: int - 每日请求限制
+            - concurrentLimit: int - 并发请求限制
+            - monthlyRequestLimit: int - 每月请求限制
+            - appId: str - 关联应用 ID
+            - note: str - 备注说明
+            - expiresAt: str - 过期时间
+        identity: 用户身份上下文
+
+    返回：
+        dict: 创建的 API Key 记录（包含完整密钥，仅创建时返回一次）
+    """
+    _assert_api_key_manager(identity)
+    result = create_api_key(
+        name=str(payload.get("name") or ""),
+        kb_ids=list(payload.get("kbIds") or []),
+        capabilities=list(payload.get("capabilities") or []),
+        require_signature=bool(payload.get("requireSignature", True)),
+        allowed_ips=list(payload.get("allowedIps") or []),
+        rpm_limit=int(payload.get("rpmLimit") or 0),
+        daily_request_limit=int(payload.get("dailyRequestLimit") or 0),
+        concurrent_limit=int(payload.get("concurrentLimit") or 0),
+        monthly_request_limit=int(payload.get("monthlyRequestLimit") or 0),
+        app_id=payload.get("appId"),
+        note=str(payload.get("note") or ""),
+        expires_at=payload.get("expiresAt"),
+        identity=identity,
+    )
+    append_audit_log(
+        AuditLogRecord(
+            action="api_key.create",
+            resource_type="api_key",
+            resource_id=result.get("id"),
+            api_key_id=result.get("id"),
+            identity=identity,
+            outcome="success",
+            risk_level="high",
+            summary=f"Created API Key {result.get('id')}",
+            metadata={
+                "name": result.get("name"),
+                "kbIds": result.get("kbIds", []),
+                "capabilities": result.get("capabilities", []),
+                "requireSignature": result.get("requireSignature"),
+                "allowedIps": result.get("allowedIps", []),
+                "rpmLimit": result.get("rpmLimit"),
+                "dailyRequestLimit": result.get("dailyRequestLimit"),
+                "concurrentLimit": result.get("concurrentLimit"),
+                "monthlyRequestLimit": result.get("monthlyRequestLimit"),
+                "appId": result.get("appId"),
+                "expiresAt": result.get("expiresAt"),
+            },
+        )
+    )
+    return result
+
+
+def update_console_api_key(key_id: str, payload: dict, identity: IdentityContext | None = None) -> dict | None:
+    """
+    更新 API Key
+
+    更新指定的 API Key 记录，支持部分字段更新。
+    操作会记录相应风控级别的审计日志。
+
+    参数：
+        key_id: API Key ID
+        payload: 更新数据字典
+        identity: 用户身份上下文
+
+    返回：
+        dict | None: 更新后的 API Key 记录，不存在时返回 None
+    """
+    _assert_api_key_manager(identity)
+    result = update_api_key(
+        key_id,
+        name=payload.get("name") if "name" in payload else None,
+        status=payload.get("status") if "status" in payload else None,
+        kb_ids=list(payload.get("kbIds")) if "kbIds" in payload and payload.get("kbIds") is not None else None,
+        capabilities=(
+            list(payload.get("capabilities"))
+            if "capabilities" in payload and payload.get("capabilities") is not None
+            else None
+        ),
+        require_signature=payload.get("requireSignature") if "requireSignature" in payload else None,
+        allowed_ips=list(payload.get("allowedIps")) if "allowedIps" in payload and payload.get("allowedIps") is not None else None,
+        rpm_limit=payload.get("rpmLimit") if "rpmLimit" in payload else None,
+        daily_request_limit=payload.get("dailyRequestLimit") if "dailyRequestLimit" in payload else None,
+        concurrent_limit=payload.get("concurrentLimit") if "concurrentLimit" in payload else None,
+        monthly_request_limit=payload.get("monthlyRequestLimit") if "monthlyRequestLimit" in payload else None,
+        app_id=payload.get("appId") if "appId" in payload else None,
+        app_id_provided="appId" in payload,
+        note=payload.get("note") if "note" in payload else None,
+        expires_at=payload.get("expiresAt") if "expiresAt" in payload else None,
+        expires_at_provided="expiresAt" in payload,
+        identity=identity,
+    )
+    if result:
+        append_audit_log(
+            AuditLogRecord(
+                action="api_key.update",
+                resource_type="api_key",
+                resource_id=key_id,
+                api_key_id=key_id,
+                identity=identity,
+                outcome="success",
+                risk_level="high" if payload.get("status") == "disabled" else "medium",
+                summary=f"Updated API Key {key_id}",
+                metadata={"changedFields": sorted(payload.keys())},
+            )
+        )
+    return result
+
+
+def rotate_console_api_key(key_id: str, identity: IdentityContext | None = None) -> dict | None:
+    """
+    轮转 API Key 密钥
+
+    生成新的 API Key 密钥，旧密钥立即失效。
+    操作会记录高风控级别的审计日志。
+
+    参数：
+        key_id: API Key ID
+        identity: 用户身份上下文
+
+    返回：
+        dict | None: 轮转后的 API Key 记录（包含新密钥），不存在时返回 None
+    """
+    _assert_api_key_manager(identity)
+    result = rotate_api_key(key_id, identity)
+    if result:
+        append_audit_log(
+            AuditLogRecord(
+                action="api_key.rotate",
+                resource_type="api_key",
+                resource_id=key_id,
+                api_key_id=key_id,
+                identity=identity,
+                outcome="success",
+                risk_level="high",
+                summary=f"Rotated API Key {key_id}",
+                metadata={"keyPrefix": result.get("keyPrefix"), "keySuffix": result.get("keySuffix")},
+            )
+        )
+    return result
+
+
+def delete_console_api_key(key_id: str, identity: IdentityContext | None = None) -> bool:
+    """
+    删除 API Key
+
+    删除指定的 API Key 记录。删除后密钥立即失效。
+    操作会记录高风控级别的审计日志。
+
+    参数：
+        key_id: API Key ID
+        identity: 用户身份上下文
+
+    返回：
+        bool: 是否成功删除
+    """
+    _assert_api_key_manager(identity)
+    deleted = delete_api_key(key_id, identity)
+    if deleted:
+        append_audit_log(
+            AuditLogRecord(
+                action="api_key.delete",
+                resource_type="api_key",
+                resource_id=key_id,
+                api_key_id=key_id,
+                identity=identity,
+                outcome="success",
+                risk_level="high",
+                summary=f"Deleted API Key {key_id}",
+            )
+        )
+    return deleted
+
+
 def _required_external_config_text(value: object, field_name: str) -> str:
-    """验证必填文本字段"""
+    """
+    验证必填文本字段
+
+    检查字段值是否为非空文本，为空时抛出 ValueError。
+
+    参数：
+        value: 字段值
+        field_name: 字段名称（用于错误信息）
+
+    返回：
+        str: 去除首尾空白后的文本值
+
+    异常：
+        ValueError: 字段值为空时抛出
+    """
     text = str(value or "").strip()
     if not text:
         raise ValueError(f"{field_name} is required")
     return text
 
 
+def _assert_api_key_manager(identity: IdentityContext | None) -> None:
+    """
+    验证 API Key 管理权限
+
+    检查用户是否有权限管理 API Key，无权限时抛出 PermissionError。
+    需要租户管理员或平台管理员权限。
+
+    参数：
+        identity: 用户身份上下文
+
+    异常：
+        PermissionError: 权限不足时抛出
+    """
+    if identity and identity.enforce_access and not (identity.is_tenant_admin or identity.is_platform_admin):
+        raise PermissionError("Only tenant or platform administrators can manage API Keys")
+
+
 def _assert_external_system_config_manager(identity: IdentityContext | None) -> None:
-    """验证外部系统配置管理权限"""
+    """
+    验证外部系统配置管理权限
+
+    检查用户是否有权限管理外部系统配置，无权限时抛出 PermissionError。
+    需要平台管理员或租户管理员权限。
+
+    参数：
+        identity: 用户身份上下文
+
+    异常：
+        PermissionError: 权限不足时抛出
+    """
     if identity and identity.enforce_access:
         if identity.is_platform_admin or TENANT_ADMIN_ROLE_CODE in {str(role) for role in identity.role_codes}:
             return
@@ -2073,6 +2909,37 @@ def _assert_external_system_config_manager(identity: IdentityContext | None) -> 
 
 
 def _ingestion_task_row(task: dict, kb: dict | None = None) -> dict:
+    """
+    构建入库任务行数据
+
+    将任务数据转换为前端展示格式，包含阶段进度、耗时等信息。
+
+    参数：
+        task: 原始任务数据字典
+        kb: 知识库信息字典（可选）
+
+    返回：
+        dict: 任务行数据，包含：
+            - id / taskId: 任务 ID
+            - kbId / kbName: 知识库信息
+            - documentName: 文档名称
+            - status: 任务状态
+            - strategy: 切片策略
+            - createdAt / updatedAt: 时间信息
+            - actorId / actorName / actorSource: 操作者信息
+            - tenantId / tenantName: 租户信息
+            - apiKeyId / appId / documentId: 关联 ID
+            - parseMethod: 解析方法
+            - sourceType / sourceSummary: 来源信息
+            - fastImport: 是否快速导入
+            - skippedStages: 跳过的阶段
+            - chunkCount: 切片数量
+            - totalLatencyMs: 总耗时（毫秒）
+            - currentStage: 当前阶段
+            - error: 错误信息
+            - stages: 阶段列表
+            - chunkTimings: 切片耗时明细
+    """
     stages = list((task.get("stages") or {}).values())
     stage_payload = []
     total_latency_ms = 0
@@ -2107,7 +2974,13 @@ def _ingestion_task_row(task: dict, kb: dict | None = None) -> dict:
         "createdAt": task.get("created_at", ""),
         "updatedAt": task.get("updated_at", ""),
         "actorId": actor_id,
-        "actorName": actor_id or "未记录",
+        "actorName": str(task.get("actor_name") or actor_id or "未记录"),
+        "actorSource": str(task.get("actor_source") or ""),
+        "tenantId": str(task.get("tenant_id") or ""),
+        "tenantName": str(task.get("tenant_name") or ""),
+        "apiKeyId": str(task.get("api_key_id") or ""),
+        "appId": str(task.get("app_id") or ""),
+        "documentId": str(task.get("document_id") or ""),
         "parseMethod": task.get("parse_provider") or task.get("parse_method") or "mineru",
         "sourceType": task.get("source_type", "file"),
         "sourceSummary": task.get("source_summary", task.get("filename", "")),
@@ -2123,6 +2996,15 @@ def _ingestion_task_row(task: dict, kb: dict | None = None) -> dict:
 
 
 def _stage_label(key: str) -> str:
+    """
+    获取阶段的中文标签
+
+    参数：
+        key: 阶段键名
+
+    返回：
+        str: 中文标签
+    """
     return {
         "upload": "上传",
         "parse": "解析",

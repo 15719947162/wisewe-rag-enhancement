@@ -1,91 +1,58 @@
-"""
-质量门控模块 - 切片质量过滤器
-
-本模块是 RAG 管道的"质检员"，负责在切片后过滤掉低质量的内容。
-就好比工厂里的质检流水线，把不合格的产品剔除出去。
-
-【为什么需要质量门控？】
-在 PDF 解析和切片过程中，会产生一些"垃圾内容"：
-- 只有标点符号的片段（比如 "......" 或 "，，，，"）
-- 毫无意义的碎片（比如列表符号、"见图 XX" 等）
-- 内容空洞的段落（没有实际知识价值）
-
-这些低质量内容如果进入知识库，会：
-1. 浪费存储空间和向量化成本
-2. 干扰检索结果（噪音变多）
-3. 降低 RAG 系统的回答质量
-
-【质量门控的工作流程】
-1. 规则过滤（快速）：按标点比例判断是否为垃圾内容
-2. LLM 评分（可选）：用大模型给内容打分，判断知识价值
-
-【核心概念】
-- 丢弃（Discarded）：直接剔除，不进入知识库
-- 低质量（Low Quality）：分数低但可能保留（用于分析）
-- 豁免（Exempt）：表格和图片切片跳过质量检查
-"""
-
 from __future__ import annotations
 
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Callable
 
 from core.http_client import create_openai_client
 from core.llm_config import resolve_llm_param
+from core.llm_key_pool import ApiKeyPool, is_throttle_error, parse_api_key_pool
 from core.llm_usage import TokenUsage
 from core.models.content_block import Chunk
-# 导入系统提示词相关的工具：
-# - QUALITY_GATE_SYSTEM_PROMPT_DEFAULT: 默认的质量门控提示词（UTF-8 编码的正确中文）
-# - normalize_quality_gate_system_prompt(): 标准化提示词，修复编码问题
 from core.runtime_settings import QUALITY_GATE_SYSTEM_PROMPT_DEFAULT, normalize_quality_gate_system_prompt
+
+
+QUALITY_GATE_OUTPUT_CONTRACT = (
+    "输出格式必须是严格 JSON 数组，不要 Markdown、不要解释、不要额外文本。"
+    "每一项只需要 index 和 score，例如："
+    '[{"index":0,"score":5}]。'
+    "reason 仅在 score<=2 时可选，且不超过 12 个字；不要为高分项输出 reason。"
+    "score 只能是 1 到 5 的整数：5=内容完整且知识密度高，4=有明确知识点，"
+    "3=信息有限但可检索，2=碎片化或价值较低，1=乱码、空内容或明显解析噪声。"
+)
 
 
 @dataclass
 class DiscardedChunk:
-    """被丢弃的切片记录
-
-    记录每个被质量门控过滤掉的切片的详细信息，方便后续分析和调试。
-    就像质检员填写的"不合格产品报告单"。
-
-    Attributes:
-        chunk_index: 切片的序号（在原始列表中的位置）
-        reason: 丢弃原因，用大白话解释为什么这个切片不合格
-                例如："纯标点/符号（占比 95%）" 或 "LLM 质量评分不足（2/5 < 3/5）"
-        preview: 切片内容的预览（前 60 个字符），方便快速查看被丢弃的内容
-        score: 如果使用了 LLM 评分，记录大模型给的分数（1-5 分），默认为 0 表示未评分
-    """
     chunk_index: int
     reason: str
     preview: str
-    score: int = 0  # LLM score if used
+    score: int = 0
 
 
 @dataclass
 class QualityGateResult:
-    """质量门控的结果报告
-
-    这是质量门控的"质检报告"，记录了整个过滤过程的统计信息。
-    包含通过质检的切片、被丢弃的切片，以及各种统计数据。
-
-    Attributes:
-        chunks: 通过质检的切片列表，这些切片将被保留并进入后续流程（向量化、入库等）
-        discarded_count: 被丢弃的切片总数（包括规则过滤和 LLM 评分不达标的）
-        low_quality_count: 低质量切片数量（已废弃，目前未使用）
-        details: 质检过程的详细说明列表，每条说明记录一次重要的过滤操作
-                 例如：["质量门控丢弃: 5 个低质量切片"]
-        discarded_chunks: 被丢弃切片的详细记录列表，每个元素都是 DiscardedChunk 对象
-                          方便开发者排查问题或调优过滤规则
-        scores: LLM 评分字典，记录每个切片的得分（key 是 chunk_index，value 是分数 1-5）
-                如果没有启用 LLM 评分，这个字典为空
-        metrics: 统计指标字典，记录 Token 使用量等性能数据
-                 例如：{"qualityLlm_input_tokens": 1500, "qualityLlm_output_tokens": 300}
-    """
     chunks: list[Chunk]
     discarded_count: int = 0
     low_quality_count: int = 0
     details: list[str] = field(default_factory=list)
     discarded_chunks: list[DiscardedChunk] = field(default_factory=list)
-    scores: dict[int, int] = field(default_factory=dict)  # chunk_index → LLM score
+    scores: dict[int, int] = field(default_factory=dict)
     metrics: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class _BatchScoreResult:
+    batch_number: int
+    offset: int
+    input_count: int
+    scores: dict[int, int]
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    latency_ms: int = 0
+    error: str = ""
 
 
 def apply_quality_gate(
@@ -95,149 +62,87 @@ def apply_quality_gate(
     score_only: bool = False,
     llm_base_url: str = "",
     llm_api_key: str = "",
+    llm_api_key_pool: str = "",
     llm_model: str = "",
     llm_system_prompt: str = "",
+    llm_key_retries: int = 1,
+    llm_key_cooldown_seconds: int = 30,
+    llm_batch_size: int = 10,
+    llm_max_concurrency: int = 4,
+    llm_progress_callback: Callable[[int, int], None] | None = None,
 ) -> QualityGateResult:
-    """应用质量门控 - 过滤低质量切片
+    """Post-chunking quality filter."""
+    kept: list[Chunk] = []
+    discarded: list[DiscardedChunk] = []
+    details: list[str] = []
 
-    这是质量门控的主入口函数，负责执行切片质量检查并过滤不合格的内容。
-    就像安检通道，只有符合要求的切片才能通过。
-
-    【两道关卡】
-    第一关：规则过滤（快速、低成本）
-        - 检查标点符号占比，如果太高就丢弃
-        - 表格和图片切片直接放行（豁免检查）
-
-    第二关：LLM 评分（可选、高精度）
-        - 只有当 min_score > 0 时才启用
-        - 用大模型判断内容的知识价值（1-5 分）
-        - 分数低于阈值的切片会被丢弃
-
-    【使用场景】
-    1. 快速模式：只启用规则过滤（min_score=0）
-       适合大规模处理，速度快、成本低
-    2. 精细模式：同时启用 LLM 评分（min_score>0）
-       适合高质量要求，过滤更精准，但会增加 API 调用成本
-    3. 分析模式：启用评分但不丢弃（score_only=True）
-       用于评估切片质量，生成报告，不实际过滤
-
-    Args:
-        chunks: 待检查的切片列表（通常是 chunker 模块的输出）
-        max_punct_ratio: 标点符号占比阈值，默认 0.9（90%）
-                        如果切片中 90% 以上都是标点符号/非字母数字，就丢弃
-                        可以理解为：内容要有至少 10% 的"干货"
-        min_score: LLM 评分的最低合格线（1-5 分），默认 0 表示不启用 LLM 评分
-                  推荐值：3（基本合格）、4（较高质量）
-        score_only: 是否只评分不过滤，默认 False
-                   True = 给所有切片打分，但全部保留（用于质量分析）
-                   False = 分数低的切片会被丢弃
-        llm_base_url: LLM API 的基础 URL（可选，不填则使用环境变量）
-        llm_api_key: LLM API 的密钥（可选，不填则使用环境变量）
-        llm_model: LLM 模型名称（可选，默认 qwen-plus）
-        llm_system_prompt: 自定义系统提示词（可选，不填则使用默认提示词）
-
-    Returns:
-        QualityGateResult: 质检结果对象，包含：
-            - 通过质检的切片列表
-            - 被丢弃的切片数量和详情
-            - LLM 评分结果（如果启用）
-            - Token 使用统计
-
-    Example:
-        # 快速模式 - 只过滤纯标点
-        result = apply_quality_gate(chunks, max_punct_ratio=0.9)
-
-        # 精细模式 - 启用 LLM 评分
-        result = apply_quality_gate(chunks, min_score=3)
-
-        # 分析模式 - 只评分不过滤
-        result = apply_quality_gate(chunks, min_score=3, score_only=True)
-        print(f"平均质量分: {sum(result.scores.values()) / len(result.scores):.1f}")
-    """
-    # ========== 第一关：规则过滤 ==========
-    # 初始化结果容器
-    kept: list[Chunk] = []          # 通过质检的切片
-    discarded: list[DiscardedChunk] = []  # 被丢弃的切片
-    details: list[str] = []         # 过程记录
-
-    # 先对文本切片应用规则过滤（表格和图片豁免）
-    text_chunks = []
+    text_chunks: list[Chunk] = []
     for chunk in chunks:
-        # 表格和图片切片直接放行，不检查质量
-        # 因为它们的"内容"可能是 HTML 或路径，不适合用文本规则判断
         if chunk.is_table_chunk or chunk.is_image_chunk:
             kept.append(chunk)
             continue
 
         text = chunk.content.strip()
-
-        # 标点符号占比检查：计算非字母数字、非空格的字符比例
-        # 如果大部分都是标点符号，说明这个切片没有实质内容
         punct_count = sum(1 for c in text if not c.isalnum() and not c.isspace())
         if len(text) > 0 and punct_count / len(text) > max_punct_ratio:
-            # 标点占比过高，丢弃该切片
-            discarded.append(DiscardedChunk(
-                chunk_index=chunk.chunk_index,
-                reason=f"纯标点/符号（占比 {punct_count/len(text):.0%}）",
-                preview=text[:60],
-            ))
+            discarded.append(
+                DiscardedChunk(
+                    chunk_index=chunk.chunk_index,
+                    reason=f"punctuation_ratio>{max_punct_ratio:.0%}",
+                    preview=text[:60],
+                )
+            )
             continue
 
-        # 通过第一关规则过滤，准备进入第二关（LLM 评分）
         text_chunks.append(chunk)
 
-    # ========== 第二关：LLM 评分（可选） ==========
-    # 只有当 min_score > 0 时才启用 LLM 评分
-    llm_scores: dict[int, int] = {}  # 记录每个切片的分数
-    metrics: dict[str, int] = {}     # 记录 Token 使用量等指标
-
+    llm_scores: dict[int, int] = {}
+    metrics: dict[str, int] = {}
     if min_score > 0 and text_chunks:
-        # 调用 LLM 对所有文本切片进行评分
         scored, llm_metrics = _llm_score_chunks(
-            text_chunks, min_score,
+            text_chunks,
+            min_score,
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
+            llm_api_key_pool=llm_api_key_pool,
             llm_model=llm_model,
             llm_system_prompt=llm_system_prompt,
+            llm_key_retries=llm_key_retries,
+            llm_key_cooldown_seconds=llm_key_cooldown_seconds,
+            llm_batch_size=llm_batch_size,
+            llm_max_concurrency=llm_max_concurrency,
+            progress_callback=llm_progress_callback,
         )
         metrics.update(llm_metrics)
-
-        # 根据评分结果决定是否保留切片
         for chunk, score in scored:
             llm_scores[chunk.chunk_index] = score
-
             if score_only:
-                # 分析模式：只记录分数，不丢弃任何切片
                 kept.append(chunk)
             elif score < min_score:
-                # 分数不达标，丢弃切片
-                discarded.append(DiscardedChunk(
-                    chunk_index=chunk.chunk_index,
-                    reason=f"LLM 质量评分不足（{score}/5 < {min_score}/5）",
-                    preview=chunk.content[:60],
-                    score=score,
-                ))
+                discarded.append(
+                    DiscardedChunk(
+                        chunk_index=chunk.chunk_index,
+                        reason=f"llm_score<{min_score}",
+                        preview=chunk.content[:60],
+                        score=score,
+                    )
+                )
             else:
-                # 分数达标，保留切片
                 kept.append(chunk)
     else:
-        # 未启用 LLM 评分，所有通过规则过滤的切片都保留
         kept.extend(text_chunks)
 
-    # ========== 生成结果报告 ==========
-    # 统计被丢弃的切片数量
-    n_discarded = len(discarded)
-    if n_discarded:
-        details.append(f"质量门控丢弃: {n_discarded} 个低质量切片")
+    discarded_count = len(discarded)
+    if discarded_count:
+        details.append(f"quality_gate_discarded={discarded_count}")
 
-    # 返回质检结果
     return QualityGateResult(
-        chunks=kept,                 # 通过质检的切片
-        discarded_count=n_discarded, # 被丢弃的数量
-        details=details,             # 过程记录
-        discarded_chunks=discarded,  # 被丢弃的详情（用于调试）
-        scores=llm_scores,           # LLM 评分结果
-        metrics=metrics,             # Token 使用统计
+        chunks=kept,
+        discarded_count=discarded_count,
+        details=details,
+        discarded_chunks=discarded,
+        scores=llm_scores,
+        metrics=metrics,
     )
 
 
@@ -246,181 +151,434 @@ def _llm_score_chunks(
     min_score: int,
     llm_base_url: str = "",
     llm_api_key: str = "",
+    llm_api_key_pool: str = "",
     llm_model: str = "",
     llm_system_prompt: str = "",
+    llm_key_retries: int = 1,
+    llm_key_cooldown_seconds: int = 30,
+    llm_batch_size: int = 10,
+    llm_max_concurrency: int = 4,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[tuple[Chunk, int]], dict[str, int]]:
-    """使用 LLM 对切片进行质量评分（内部函数）
-
-    这是质量门控的"高级质检员"，用大模型来判断切片的知识价值。
-    比简单的规则过滤更智能，但也会消耗 API 调用成本。
-
-    【评分标准（1-5 分）】
-    5分（优秀）：内容完整、信息丰富、有明确知识点
-        例如："机器学习是人工智能的一个分支，它使计算机能够从数据中学习..."
-
-    4分（良好）：有一定价值，信息基本完整
-        例如："深度学习是机器学习的子领域，使用神经网络进行特征学习。"
-
-    3分（合格）：内容有限，但有一定参考价值
-        例如："详见第 5 章内容。" 或 "如图所示。"
-
-    2分（较差）：信息碎片化，价值较低
-        例如："（续上表）" 或 "......"
-
-    1分（不合格）：无实质内容
-        例如："•" 或 "，，，" 或 "注："
-
-    【工作流程】
-    1. 配置检查：从环境变量或参数获取 API Key、模型等配置
-    2. 批量处理：每批处理 10 个切片（节省 API 调用次数）
-    3. LLM 调用：将切片内容发送给大模型，要求返回 JSON 格式的评分
-    4. 异常处理：如果 LLM 调用失败，给该批次切片打默认分（3 分）
-    5. 统计汇总：记录 Token 使用量，返回评分结果
-
-    Args:
-        chunks: 待评分的切片列表（已经过规则过滤，不含表格/图片）
-        min_score: 最低合格分数（1-5），低于此分数的切片将被标记为低质量
-        llm_base_url: LLM API 基础 URL（可选）
-        llm_api_key: LLM API 密钥（可选）
-        llm_model: LLM 模型名称（可选，默认 qwen-plus）
-        llm_system_prompt: 自定义系统提示词（可选）
-
-    Returns:
-        tuple: 包含两个元素：
-            - list[tuple[Chunk, int]]: 切片和分数的配对列表
-              例如：[(chunk1, 5), (chunk2, 3), (chunk3, 4)]
-            - dict[str, int]: Token 使用统计
-              例如：{"qualityLlm_input_tokens": 1500, "qualityLlm_output_tokens": 300}
-
-    Note:
-        - 如果没有配置 API Key，所有切片都会被评 5 分（默认通过）
-        - 每个切片只发送前 300 个字符给 LLM（节省 Token）
-        - 批量大小为 10，即一次 API 调用评分 10 个切片
-        - 默认使用 qwen-plus 模型，可通过环境变量 LLM_CLEANER_MODEL 修改
-    """
-    import json
-
-    # ========== 第一步：解析配置参数 ==========
-    # 按优先级获取 API Key：函数参数 > 环境变量
+    """Score chunks with LLM (1-5). Returns (chunk, score) pairs."""
+    del min_score
     api_key = resolve_llm_param(
-        llm_api_key, "api_key",
-        ["LLM_API_KEY", "DASHSCOPE_API_KEY"],
+        llm_api_key,
+        "api_key",
+        ["LLM_QUALITY_GATE_API_KEY", "LLM_API_KEY", "DASHSCOPE_API_KEY"],
     )
-    if not api_key:
-        # 没有配置 API Key，直接给所有切片打高分（默认通过）
-        return [(c, 5) for c in chunks], {}
+    pool_value = resolve_llm_param(
+        llm_api_key_pool,
+        "api_key_pool",
+        ["LLM_QUALITY_GATE_API_KEY_POOL", "LLM_API_KEY_POOL"],
+        "",
+    )
+    keys = parse_api_key_pool(api_key, pool_value)
+    if not keys:
+        return [(chunk, 5) for chunk in chunks], {}
 
-    # 按优先级获取 Base URL：函数参数 > 环境变量 > 默认值（DashScope）
     base_url = resolve_llm_param(
-        llm_base_url, "base_url",
-        ["LLM_BASE_URL"],
+        llm_base_url,
+        "base_url",
+        ["LLM_QUALITY_GATE_BASE_URL", "LLM_BASE_URL"],
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
-
-    # 按优先级获取模型名称：函数参数 > 环境变量 > 默认值（qwen-plus）
     model = resolve_llm_param(
-        llm_model, "model",
-        ["LLM_CLEANER_MODEL"],
+        llm_model,
+        "model",
+        ["LLM_QUALITY_GATE_MODEL", "LLM_CLEANER_MODEL"],
         "qwen-plus",
     )
-
-    # 按优先级获取系统提示词：函数参数 > 环境变量 > 默认提示词
     system_prompt = llm_system_prompt or resolve_llm_param(
-        "", "quality_gate_system_prompt", ["LLM_QUALITY_GATE_SYSTEM_PROMPT"],
         "",
-    ) or resolve_llm_param(
-        "", "system_prompt", [],
-        (
-            "你是知识库质量评估助手。对每个文本片段评估其作为检索知识库条目的价值，打分 1-5：\n"
-            "5分：内容完整、信息丰富、有明确知识点\n"
-            "4分：有一定价值，信息基本完整\n"
-            "3分：内容有限，但有一定参考价值\n"
-            "2分：信息碎片化，价值较低\n"
-            "1分：无实质内容（列表符号、空洞描述、无意义片段）\n\n"
-            "返回 JSON 数组，每项：{\"index\": 序号, \"score\": 分数, \"reason\": \"一句话理由\"}"
-        ),
+        "quality_gate_system_prompt",
+        ["LLM_QUALITY_GATE_SYSTEM_PROMPT"],
+        "",
     )
-
-    # ========== 系统提示词编码问题验证 ==========
-    # 【为什么要检测编码问题？】
-    # 在某些环境下（如 Windows 控制台、某些编辑器），中文字符可能被错误编码。
-    # 例如：
-    # - "你是" 的 UTF-8 字节序列 (0xE4 0xBD 0xA0 0xE6 0x98 0xAF) 被误读为 GBK，会显示为"浣犳槸"
-    # - 标点符号"：" 的 UTF-8 字节 (0xEF 0xBC 0x9A) 被误读为 GBK，会显示为"锛"
-    # - 引号""" 的 UTF-8 字节被误读，会包含"銆"等乱码字符
-    #
-    # 【编码问题的来源】
-    # 1. 环境变量从终端读取时编码不一致（终端是 GBK，但内容是 UTF-8）
-    # 2. 配置文件保存时使用了错误的编码
-    # 3. 从数据库或其他系统读取时编码转换错误
-    #
-    # 【检测特定字符的原因】
-    # "浣犳槸" 是"你是" 的 GBK 误读，这是系统提示词中最常见的开头
-    # "銆" 常出现在标点符号被错误编码时（如冒号、引号等）
-    # 通过检测这两个特征字符，可以快速判断整个提示词是否存在编码问题
-    #
-    # 【何时触发默认提示词】
-    # 1. 自定义提示词包含编码错误（检测到"浣犳槸"或"銆"）
-    # 2. normalize_quality_gate_system_prompt() 返回空（提示词完全无效）
-    # 3. 环境变量 LLM_QUALITY_GATE_SYSTEM_PROMPT 未设置或为空
-    #
-    # 触发后会使用 QUALITY_GATE_SYSTEM_PROMPT_DEFAULT 作为备用，确保 LLM 能正确理解评分标准
     system_prompt = normalize_quality_gate_system_prompt(system_prompt) or QUALITY_GATE_SYSTEM_PROMPT_DEFAULT
-    if "浣犳槸" in system_prompt or "銆" in system_prompt:
+    if "娴ｇ姵妲" in system_prompt or "閵" in system_prompt:
         system_prompt = QUALITY_GATE_SYSTEM_PROMPT_DEFAULT
+    system_prompt = _with_output_contract(system_prompt)
 
-    # ========== 第二步：创建 LLM 客户端 ==========
+    key_pool = ApiKeyPool(
+        "quality",
+        keys,
+        cooldown_seconds=max(0, int(llm_key_cooldown_seconds or 0)),
+    )
+    batch_size = max(1, int(llm_batch_size or 20))
+    max_workers = max(1, int(llm_max_concurrency or 1))
+    max_workers = min(max_workers, max(1, (len(chunks) + batch_size - 1) // batch_size))
+
+    batches = [
+        (batch_number, offset, chunks[offset: offset + batch_size])
+        for batch_number, offset in enumerate(range(0, len(chunks), batch_size), start=1)
+    ]
+    batch_results: list[_BatchScoreResult] = []
+    completed_batches = 0
+    total_batches = len(batches)
+    if max_workers <= 1 or len(batches) <= 1:
+        for batch_number, offset, batch in batches:
+            batch_results.append(
+                _score_batch_with_key_pool(
+                    batch_number=batch_number,
+                    offset=offset,
+                    batch=batch,
+                    key_pool=key_pool,
+                    fallback_key=api_key or keys[0],
+                    base_url=base_url,
+                    model=model,
+                    system_prompt=system_prompt,
+                    key_retries=llm_key_retries,
+                )
+            )
+            completed_batches += 1
+            _notify_progress(progress_callback, completed_batches, total_batches)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    _score_batch_with_key_pool,
+                    batch_number=batch_number,
+                    offset=offset,
+                    batch=batch,
+                    key_pool=key_pool,
+                    fallback_key=api_key or keys[0],
+                    base_url=base_url,
+                    model=model,
+                    system_prompt=system_prompt,
+                    key_retries=llm_key_retries,
+                )
+                for batch_number, offset, batch in batches
+            ]
+            for future in as_completed(futures):
+                batch_results.append(future.result())
+                completed_batches += 1
+                _notify_progress(progress_callback, completed_batches, total_batches)
+
+    scores: dict[int, int] = {}
+    token_usage = TokenUsage()
+    for batch_result in sorted(batch_results, key=lambda result: result.batch_number):
+        scores.update(batch_result.scores)
+        token_usage.add(batch_result.token_usage)
+
+    metrics = _quality_metrics(token_usage, batch_results, key_pool, batch_size, max_workers)
+    return [(chunk, scores.get(index, 3)) for index, chunk in enumerate(chunks)], metrics
+
+
+def _notify_progress(
+    progress_callback: Callable[[int, int], None] | None,
+    completed_batches: int,
+    total_batches: int,
+) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(completed_batches, total_batches)
+    except Exception:
+        return
+
+
+def _score_batch_with_key_pool(
+    *,
+    batch_number: int,
+    offset: int,
+    batch: list[Chunk],
+    key_pool: ApiKeyPool,
+    fallback_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    key_retries: int,
+) -> _BatchScoreResult:
+    if key_pool.size <= 0:
+        return _score_batch(
+            batch_number=batch_number,
+            offset=offset,
+            batch=batch,
+            api_key=fallback_key,
+            base_url=base_url,
+            model=model,
+            system_prompt=system_prompt,
+        )
+
+    attempted: set[str] = set()
+    max_attempts = max(1, min(key_pool.size, int(key_retries or 0) + 1))
+    last_result: _BatchScoreResult | None = None
+    for attempt in range(max_attempts):
+        lease = key_pool.acquire(exclude_keys=attempted)
+        if lease is None:
+            break
+        started = time.monotonic()
+        try:
+            result = _score_batch(
+                batch_number=batch_number,
+                offset=offset,
+                batch=batch,
+                api_key=lease.key,
+                base_url=base_url,
+                model=model,
+                system_prompt=system_prompt,
+            )
+        finally:
+            key_pool.release(lease)
+        throttled = bool(result.error and is_throttle_error(result.error))
+        key_pool.record_attempt(
+            lease,
+            result.latency_ms or int((time.monotonic() - started) * 1000),
+            success=not result.error,
+            throttled=throttled,
+        )
+        last_result = result
+        if throttled:
+            key_pool.mark_throttled(lease)
+            attempted.add(lease.key)
+            if attempt < max_attempts - 1:
+                key_pool.record_retry()
+                continue
+        return result
+    return last_result or _default_batch_result(batch_number, offset, batch, "no_available_quality_key")
+
+
+def _score_batch(
+    *,
+    batch_number: int,
+    offset: int,
+    batch: list[Chunk],
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+) -> _BatchScoreResult:
+    started = time.monotonic()
+    token_usage = TokenUsage()
+    items = [{"index": index, "text": chunk.content[:200]} for index, chunk in enumerate(batch)]
     try:
         client = create_openai_client(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+            ],
+            temperature=0,
+            max_tokens=max(96, min(512, len(batch) * 18 + 32)),
+        )
+        token_usage.add_response(response)
+        content = response.choices[0].message.content or "[]"
+        scores = _parse_score_content(content, offset, len(batch))
+        if not scores:
+            raise ValueError("no_parseable_quality_scores")
+        for local_index in range(len(batch)):
+            scores.setdefault(offset + local_index, 3)
+        return _BatchScoreResult(
+            batch_number=batch_number,
+            offset=offset,
+            input_count=len(batch),
+            scores=scores,
+            token_usage=token_usage,
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
     except ImportError:
-        # 如果缺少依赖库，默认给所有切片打中等分数
-        return [(c, 5) for c in chunks], {}
+        return _default_batch_result(
+            batch_number,
+            offset,
+            batch,
+            "client_unavailable",
+            default_score=5,
+            started=started,
+        )
+    except Exception as exc:
+        result = _default_batch_result(
+            batch_number,
+            offset,
+            batch,
+            str(exc),
+            default_score=3,
+            started=started,
+        )
+        result.token_usage.add(token_usage)
+        return result
 
-    # ========== 第三步：批量调用 LLM 进行评分 ==========
-    batch_size = 10  # 每批处理 10 个切片，平衡 API 调用次数和响应延迟
-    results: dict[int, int] = {}  # 存储评分结果：{切片在批次中的索引 -> 分数}
-    token_usage = TokenUsage()    # 统计 Token 使用量
 
-    # 分批处理切片
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]  # 取出当前批次的切片
+def _with_output_contract(system_prompt: str) -> str:
+    prompt = (system_prompt or "").strip()
+    if "只需要 index 和 score" in prompt and "reason 仅在" in prompt:
+        return prompt
+    return f"{prompt}\n\n{QUALITY_GATE_OUTPUT_CONTRACT}" if prompt else QUALITY_GATE_OUTPUT_CONTRACT
 
-        # 构建评分请求数据
-        # 每个切片只发送前 300 个字符（节省 Token，大部分情况已足够判断质量）
-        items = [{"index": j, "text": c.content[:300]} for j, c in enumerate(batch)]
 
+def _strip_json_fence(content: str) -> str:
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    return text
+
+
+def _load_json_payload(content: str) -> object:
+    text = _strip_json_fence(content)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    candidates: list[str] = []
+    array_start = text.find("[")
+    array_end = text.rfind("]")
+    if array_start >= 0 and array_end > array_start:
+        candidates.append(text[array_start: array_end + 1])
+    object_start = text.find("{")
+    object_end = text.rfind("}")
+    if object_start >= 0 and object_end > object_start:
+        candidates.append(text[object_start: object_end + 1])
+    for candidate in candidates:
         try:
-            # 调用 LLM API 进行评分
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},  # 评分标准提示词
-                    {"role": "user", "content": json.dumps(items, ensure_ascii=False)},  # 待评分的切片列表
-                ],
-                temperature=0,  # 温度设为 0，确保评分结果稳定可重复
-            )
-            token_usage.add_response(response)  # 记录 Token 使用量
-
-            # 解析 LLM 返回的评分结果
-            content = response.choices[0].message.content or "[]"
-            content = content.strip()
-
-            # 如果 LLM 返回了代码块格式（如 ```json ... ```），需要提取其中的 JSON
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0]
-
-            scored = json.loads(content)  # 解析 JSON 数组
-
-            # 将评分结果存入字典（索引需要加上批次偏移量）
-            for item in scored:
-                results[i + item["index"]] = item.get("score", 3)  # 默认分数为 3
-
+            return json.loads(candidate)
         except Exception:
-            # 如果 LLM 调用失败或解析出错，给该批次所有切片打中等分数（3 分）
-            # 这样可以避免因为个别切片问题导致整个流程失败
-            for j in range(len(batch)):
-                results[i + j] = 3
+            continue
+    raise ValueError("response_is_not_json")
 
-    # ========== 第四步：返回结果 ==========
-    # 将切片和分数配对，分数默认为 3（中等质量）
-    return [(chunk, results.get(idx, 3)) for idx, chunk in enumerate(chunks)], token_usage.to_metrics("qualityLlm")
+
+def _coerce_score_item(item: dict, offset: int, batch_len: int) -> tuple[int, int] | None:
+    raw_index = item.get("index", item.get("idx", item.get("chunk_index", item.get("chunkIndex"))))
+    if raw_index is None:
+        return None
+    try:
+        local_index = int(raw_index)
+    except Exception:
+        return None
+    if not 0 <= local_index < batch_len:
+        return None
+
+    raw_score = item.get("score", item.get("quality_score", item.get("qualityScore")))
+    if raw_score is None:
+        decision = str(item.get("decision", item.get("action", ""))).lower()
+        raw_score = 1 if decision in {"discard", "drop", "filter", "reject"} else 5
+    try:
+        score = int(float(raw_score))
+    except Exception:
+        score = 3
+    return offset + local_index, min(5, max(1, score))
+
+
+def _scores_from_json_payload(payload: object, offset: int, batch_len: int) -> dict[int, int]:
+    if isinstance(payload, dict):
+        for key in ("scores", "results", "items", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                payload = value
+                break
+        else:
+            keyed_scores: dict[int, int] = {}
+            for key, value in payload.items():
+                if str(key).isdigit():
+                    coerced = _coerce_score_item({"index": key, "score": value}, offset, batch_len)
+                    if coerced:
+                        keyed_scores[coerced[0]] = coerced[1]
+            return keyed_scores
+
+    if not isinstance(payload, list):
+        return {}
+
+    scores: dict[int, int] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        coerced = _coerce_score_item(item, offset, batch_len)
+        if coerced:
+            scores[coerced[0]] = coerced[1]
+    return scores
+
+
+def _scores_from_natural_language(content: str, offset: int, batch_len: int) -> dict[int, int]:
+    text = content or ""
+    scores: dict[int, int] = {}
+    keep_words = ("保留", "有效", "通过", "可用于问答", "有价值", "keep", "pass", "valid")
+    drop_words = ("过滤", "丢弃", "剔除", "无意义", "乱码", "噪声", "空内容", "discard", "drop", "reject", "invalid")
+    for local_index in range(batch_len):
+        marker = re.compile(
+            rf"(?:切片|片段|chunk)\s*{local_index}\b|(?:index|索引)\s*[:：]?\s*{local_index}\b",
+            re.IGNORECASE,
+        )
+        match = marker.search(text)
+        if not match:
+            continue
+        next_match = None
+        for next_index in range(local_index + 1, batch_len):
+            next_marker = re.compile(
+                rf"(?:切片|片段|chunk)\s*{next_index}\b|(?:index|索引)\s*[:：]?\s*{next_index}\b",
+                re.IGNORECASE,
+            )
+            next_match = next_marker.search(text, match.end())
+            if next_match:
+                break
+        segment = text[match.start(): next_match.start() if next_match else len(text)]
+        lowered = segment.lower()
+        if any(word in lowered for word in drop_words):
+            scores[offset + local_index] = 1
+        elif any(word in lowered for word in keep_words):
+            scores[offset + local_index] = 5
+    return scores
+
+
+def _parse_score_content(content: str, offset: int, batch_len: int) -> dict[int, int]:
+    try:
+        payload = _load_json_payload(content)
+        scores = _scores_from_json_payload(payload, offset, batch_len)
+        if scores:
+            return scores
+    except Exception:
+        pass
+    return _scores_from_natural_language(content, offset, batch_len)
+
+
+def _default_batch_result(
+    batch_number: int,
+    offset: int,
+    batch: list[Chunk],
+    error: str,
+    *,
+    default_score: int = 3,
+    started: float | None = None,
+) -> _BatchScoreResult:
+    started_at = started if started is not None else time.monotonic()
+    return _BatchScoreResult(
+        batch_number=batch_number,
+        offset=offset,
+        input_count=len(batch),
+        scores={offset + local_index: default_score for local_index in range(len(batch))},
+        latency_ms=int((time.monotonic() - started_at) * 1000),
+        error=error,
+    )
+
+
+def _quality_metrics(
+    token_usage: TokenUsage,
+    batch_results: list[_BatchScoreResult],
+    key_pool: ApiKeyPool,
+    batch_size: int,
+    max_workers: int,
+) -> dict[str, int]:
+    metrics = token_usage.to_metrics("qualityLlm")
+    metrics["qualityLlmBatchSize"] = batch_size
+    metrics["qualityLlmBatchCount"] = len(batch_results)
+    metrics["qualityLlmMaxConcurrency"] = max_workers
+    metrics["qualityLlmBatchFailures"] = sum(1 for result in batch_results if result.error)
+    key_stats = key_pool.stats()
+    metrics["qualityLlmKeyPoolSize"] = key_stats["size"]
+    metrics["qualityLlmKeyThrottleCount"] = key_stats["throttleCount"]
+    metrics["qualityLlmKeyRetryCount"] = key_stats["retryCount"]
+    metrics["qualityLlmKeyCooldownCount"] = key_stats["cooldownCount"]
+    for alias, values in key_stats["usage"].items():
+        for metric in ("calls", "successes", "failures", "throttles", "totalMs"):
+            metrics[f"qualityLlmKey.{alias}.{metric}"] = int(values.get(metric, 0))
+    for result in batch_results:
+        prefix = f"qualityLlmBatch.{result.batch_number}"
+        metrics[f"{prefix}.requests"] = result.token_usage.requests
+        metrics[f"{prefix}.promptTokens"] = result.token_usage.prompt_tokens
+        metrics[f"{prefix}.completionTokens"] = result.token_usage.completion_tokens
+        metrics[f"{prefix}.totalTokens"] = result.token_usage.total_tokens
+        metrics[f"{prefix}.latencyMs"] = result.latency_ms
+        metrics[f"{prefix}.inputCount"] = result.input_count
+        metrics[f"{prefix}.error"] = 1 if result.error else 0
+    return metrics

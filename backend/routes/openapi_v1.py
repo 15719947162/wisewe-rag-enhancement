@@ -3,11 +3,13 @@ OpenAPI v1 接口路由模块
 
 这个模块提供了标准化的 OpenAPI 接口,用于外部系统集成。
 主要功能包括:
-- 知识库管理(查询知识库列表)
+- 知识库管理(查询、创建、更新、删除知识库)
 - 文档导入(上传 PDF 并处理)
+- 文档查询
 - RAG 查询(向量检索和图谱检索)
 - 网页抓取导入
 - 备份 CSV 导入
+- 使用量查询
 
 所有 OpenAPI 接口都需要 API Key 认证,支持签名验证机制和并发控制。
 """
@@ -34,7 +36,13 @@ from backend.services.ingestion_service import (
     run_pipeline_real,
     _task_to_payload,
 )
-from backend.services.kb_service import create_knowledge_base_payload, get_knowledge_bases_payload
+from backend.services.kb_service import (
+    create_knowledge_base_payload,
+    delete_knowledge_base_payload,
+    get_documents_payload,
+    get_knowledge_bases_payload,
+    update_knowledge_base_payload,
+)
 from backend.services.rag_service import run_graph_rag_query, run_rag_query
 from core.chunker import list_strategies
 from core.db.api_keys import (
@@ -46,7 +54,12 @@ from core.db.api_keys import (
     release_api_key_concurrency_slot,
 )
 from core.db.identity import IdentityContext
-from core.db.query_logs import AuditLogRecord, append_audit_log
+from core.db.query_logs import (
+    AuditLogRecord,
+    append_audit_log,
+    fetch_processing_cost_task_detail_for_identity,
+    refresh_processing_cost_estimates,
+)
 from core.parser.provider import PDF_PARSER_CHANNELS
 from core.prompts import LAYOUT_KEY_MAP, SUBJECT_KEY_MAP
 
@@ -140,6 +153,15 @@ class OpenApiKnowledgeBaseCreateRequest(BaseModel):
     strategy: str = Field(default="hierarchical", max_length=100)
 
 
+class OpenApiKnowledgeBaseUpdateRequest(BaseModel):
+    """OpenAPI 知识库更新请求参数"""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+    strategy: str = Field(default="hierarchical", max_length=100)
+
+
 class OpenApiWebpageIngestionRequest(BaseModel):
     """OpenAPI 网页抓取请求参数"""
     model_config = ConfigDict(extra="forbid")
@@ -162,6 +184,11 @@ OPENAPI_KB_CREATE_EXAMPLE = {
     "kb_id": "kb_demo",
     "name": "示例知识库",
     "description": "用于 OpenAPI 联调的知识库",
+    "strategy": "hierarchical",
+}
+OPENAPI_KB_UPDATE_EXAMPLE = {
+    "name": "示例知识库（更新）",
+    "description": "通过 OpenAPI 更新后的知识库说明",
     "strategy": "hierarchical",
 }
 OPENAPI_WEBPAGE_INGESTION_EXAMPLE = {
@@ -197,6 +224,7 @@ OPENAPI_GRAPH_QUERY_EXAMPLE = {
 
 
 def _absolute_openapi_image_urls(value: object, request: Request) -> object:
+    """将相对图片 URL 转换为绝对 URL"""
     if isinstance(value, list):
         return [_absolute_openapi_image_urls(item, request) for item in value]
     if not isinstance(value, dict):
@@ -449,6 +477,310 @@ async def openapi_create_knowledge_base(
         _release_openapi_concurrency(guard, concurrency)
 
 
+@router.put("/openapi/v1/knowledge-bases/{kb_id}")
+async def openapi_update_knowledge_base(
+    kb_id: str,
+    request: Request,
+    payload: OpenApiKnowledgeBaseUpdateRequest = Body(..., examples=[OPENAPI_KB_UPDATE_EXAMPLE]),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """
+    更新知识库（OpenAPI）
+
+    通过 OpenAPI 接口更新已存在的知识库信息。可以更新知识库的名称、描述和切片策略。
+    此接口需要 API Key 认证并强制要求签名验证。
+
+    参数:
+        kb_id: 知识库 ID（路径参数）
+        request: FastAPI 请求对象
+        payload: 知识库更新参数
+            - name: 知识库名称（必填，最大 100 字符）
+            - description: 知识库描述（可选，最大 500 字符）
+            - strategy: 切片策略，默认 "hierarchical"
+        authorization: Bearer Token 认证头
+        x_api_key: API Key 认证头（二选一）
+        x_kb_timestamp: 签名时间戳
+        x_kb_nonce: 签名随机数
+        x_kb_body_sha256: 请求体 SHA256 哈希
+        x_kb_signature: 签名值
+        x_forwarded_for: 客户端真实 IP
+
+    返回值:
+        JSONResponse: 更新结果
+            - requestId: 请求 ID
+            - data: 更新后的知识库信息
+
+    权限要求:
+        - 需要 kb.update 权限
+        - 强制签名验证
+
+    错误情况:
+        - 401: API Key 无效或签名验证失败
+        - 403: 权限不足
+        - 404: 知识库不存在
+        - 422: 请求参数验证失败
+        - 429: 超过并发限制
+        - 503: 服务不可用
+    """
+    request_id = _request_id()
+    body = await request.body()
+    signature = _signature_payload(
+        request=request,
+        body=body,
+        timestamp=x_kb_timestamp,
+        nonce=x_kb_nonce,
+        body_sha256=x_kb_body_sha256,
+        signature=x_kb_signature,
+    )
+    client_ip = _client_ip(request, x_forwarded_for)
+    guard = _guard_openapi_call(
+        kb_id,
+        IdentityContext(),
+        request_id,
+        capability="kb.update",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=signature,
+        client_ip=client_ip,
+        force_signature=True,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+
+    strategy = _normalize_option(payload.strategy, set(list_strategies()), "hierarchical")
+    name = payload.name.strip()
+    if not name:
+        return _error_response(
+            422,
+            "VALIDATION_ERROR",
+            "Request payload validation failed",
+            request_id=request_id,
+            details={"errors": [{"loc": ["name"], "msg": "name cannot be blank"}]},
+        )
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability="kb.update",
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+
+    try:
+        try:
+            data = update_knowledge_base_payload(
+                kb_id,
+                name,
+                payload.description.strip(),
+                strategy,
+                guard.identity,
+            )
+        except ValueError as exc:
+            return _error_response(404, "KB_NOT_FOUND", str(exc), request_id=request_id)
+        return JSONResponse({"requestId": request_id, "data": data})
+    except Exception as exc:
+        return _error_response(503, "OPENAPI_KB_UPDATE_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
+@router.delete("/openapi/v1/knowledge-bases/{kb_id}")
+async def openapi_delete_knowledge_base(
+    kb_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """
+    删除知识库（OpenAPI）
+
+    通过 OpenAPI 接口删除指定的知识库。删除后知识库及其所有文档将不可恢复。
+    此接口需要 API Key 认证并强制要求签名验证。
+
+    参数:
+        kb_id: 知识库 ID（路径参数）
+        request: FastAPI 请求对象
+        authorization: Bearer Token 认证头
+        x_api_key: API Key 认证头（二选一）
+        x_kb_timestamp: 签名时间戳
+        x_kb_nonce: 签名随机数
+        x_kb_body_sha256: 请求体 SHA256 哈希
+        x_kb_signature: 签名值
+        x_forwarded_for: 客户端真实 IP
+
+    返回值:
+        JSONResponse: 删除结果
+            - requestId: 请求 ID
+            - data: 删除状态
+                - deleted: 是否删除成功
+                - kbId: 知识库 ID
+
+    权限要求:
+        - 需要 kb.delete 权限
+        - 强制签名验证
+
+    错误情况:
+        - 401: API Key 无效或签名验证失败
+        - 403: 权限不足
+        - 404: 知识库不存在
+        - 429: 超过并发限制
+        - 503: 服务不可用
+    """
+    request_id = _request_id()
+    signature = _signature_payload(
+        request=request,
+        body=b"",
+        timestamp=x_kb_timestamp,
+        nonce=x_kb_nonce,
+        body_sha256=x_kb_body_sha256,
+        signature=x_kb_signature,
+    )
+    client_ip = _client_ip(request, x_forwarded_for)
+    guard = _guard_openapi_call(
+        kb_id,
+        IdentityContext(),
+        request_id,
+        capability="kb.delete",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=signature,
+        client_ip=client_ip,
+        force_signature=True,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability="kb.delete",
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+
+    try:
+        data = delete_knowledge_base_payload(kb_id, guard.identity)
+        if not data.get("deleted"):
+            return _error_response(404, "KB_NOT_FOUND", f"Knowledge base '{kb_id}' not found", request_id=request_id)
+        return JSONResponse({"requestId": request_id, "data": {"deleted": True, "kbId": kb_id}})
+    except Exception as exc:
+        return _error_response(503, "OPENAPI_KB_DELETE_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
+@router.get("/openapi/v1/documents")
+async def openapi_documents(
+    request: Request,
+    kb_id: str = Query(..., min_length=1, max_length=255),
+    document_id: str | None = Query(default=None, max_length=255),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """
+    查询文档列表（OpenAPI）
+
+    查询指定知识库下的文档列表，或查询单个文档详情。
+    此接口需要 API Key 认证。
+
+    参数:
+        request: FastAPI 请求对象
+        kb_id: 知识库 ID（必填）
+        document_id: 文档 ID（可选，指定则返回单个文档详情）
+        authorization: Bearer Token 认证头
+        x_api_key: API Key 认证头（二选一）
+        x_kb_timestamp: 签名时间戳
+        x_kb_nonce: 签名随机数
+        x_kb_body_sha256: 请求体 SHA256 哈希
+        x_kb_signature: 签名值
+        x_forwarded_for: 客户端真实 IP
+
+    返回值:
+        JSONResponse: 文档列表或文档详情
+            - requestId: 请求 ID
+            - data: 文档列表或文档对象
+
+    权限要求:
+        - 需要 document.read 权限
+
+    错误情况:
+        - 401: API Key 无效
+        - 403: 权限不足或知识库绑定校验失败
+        - 404: 文档不存在
+        - 429: 超过并发限制
+        - 503: 服务不可用
+    """
+    request_id = _request_id()
+    signature = _signature_payload(
+        request=request,
+        body=b"",
+        timestamp=x_kb_timestamp,
+        nonce=x_kb_nonce,
+        body_sha256=x_kb_body_sha256,
+        signature=x_kb_signature,
+    )
+    client_ip = _client_ip(request, x_forwarded_for)
+    guard = _guard_openapi_call(
+        kb_id,
+        IdentityContext(),
+        request_id,
+        capability="document.read",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+
+    target_document_id = (document_id or "").strip()
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id=kb_id,
+        capability="document.read",
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+
+    try:
+        documents = get_documents_payload(kb_id, guard.identity)
+        if target_document_id:
+            matches = [item for item in documents if item.get("id") == target_document_id]
+            if not matches:
+                return _error_response(404, "DOCUMENT_NOT_FOUND", "Document not found or not accessible", request_id=request_id)
+            return JSONResponse({"requestId": request_id, "data": matches[0]})
+
+        return JSONResponse({"requestId": request_id, "data": documents})
+    except Exception as exc:
+        return _error_response(503, "OPENAPI_DOCUMENTS_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
 @router.get("/openapi/v1/ingestion/options")
 async def openapi_ingestion_options(
     request: Request,
@@ -616,6 +948,111 @@ async def openapi_ingestion_task(
         _release_openapi_concurrency(guard, concurrency)
 
 
+@router.get("/openapi/v1/usage/tasks/{task_id}")
+async def openapi_usage_task(
+    task_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_kb_timestamp: str | None = Header(default=None, alias="X-KB-Timestamp"),
+    x_kb_nonce: str | None = Header(default=None, alias="X-KB-Nonce"),
+    x_kb_body_sha256: str | None = Header(default=None, alias="X-KB-Body-SHA256"),
+    x_kb_signature: str | None = Header(default=None, alias="X-KB-Signature"),
+    x_forwarded_for: str | None = Header(default=None, alias="X-Forwarded-For"),
+) -> JSONResponse:
+    """
+    查询任务使用量明细（OpenAPI）
+
+    查询指定任务的处理成本明细，包括 Token 消耗、处理时间等信息。
+    此接口需要 API Key 认证，且只能查询绑定知识库的任务或租户范围内的任务。
+
+    参数:
+        task_id: 任务 ID（路径参数）
+        request: FastAPI 请求对象
+        limit: 返回记录数量限制（默认 100，最大 200）
+        authorization: Bearer Token 认证头
+        x_api_key: API Key 认证头（二选一）
+        x_kb_timestamp: 签名时间戳
+        x_kb_nonce: 签名随机数
+        x_kb_body_sha256: 请求体 SHA256 哈希
+        x_kb_signature: 签名值
+        x_forwarded_for: 客户端真实 IP
+
+    返回值:
+        JSONResponse: 使用量明细
+            - requestId: 请求 ID
+            - data: 任务成本明细数据
+                - taskId: 任务 ID
+                - records: 处理成本记录列表
+                - totalTokens: 总 Token 消耗
+                - totalCost: 总成本
+
+    权限要求:
+        - 需要 usage.read 权限
+        - API Key 必须绑定知识库或属于某个租户
+
+    错误情况:
+        - 401: API Key 无效
+        - 403: 权限不足或未绑定知识库
+        - 429: 超过并发限制
+        - 503: 服务不可用
+    """
+    request_id = _request_id()
+    signature = _signature_payload(
+        request=request,
+        body=b"",
+        timestamp=x_kb_timestamp,
+        nonce=x_kb_nonce,
+        body_sha256=x_kb_body_sha256,
+        signature=x_kb_signature,
+    )
+    client_ip = _client_ip(request, x_forwarded_for)
+    guard = _guard_openapi_capability(
+        request_id,
+        capability="usage.read",
+        authorization=authorization,
+        x_api_key=x_api_key,
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(guard, JSONResponse):
+        return guard
+    if not guard.kb_ids and not guard.identity.tenant_id:
+        return _openapi_kb_binding_denied(
+            guard,
+            request_id=request_id,
+            kb_id=None,
+            capability="usage.read",
+            signature=signature,
+            client_ip=client_ip,
+        )
+    concurrency = _acquire_openapi_concurrency_or_error(
+        guard,
+        request_id=request_id,
+        kb_id="*",
+        capability="usage.read",
+        signature=signature,
+        client_ip=client_ip,
+    )
+    if isinstance(concurrency, JSONResponse):
+        return concurrency
+    try:
+        refresh_processing_cost_estimates()
+        data = fetch_processing_cost_task_detail_for_identity(
+            task_id,
+            tenant_id=guard.identity.tenant_id,
+            include_all_tenants=False,
+            visible_kb_ids=list(guard.kb_ids) if guard.kb_ids else None,
+            limit=limit,
+        )
+        return JSONResponse({"requestId": request_id, "data": data})
+    except Exception as exc:
+        return _error_response(503, "OPENAPI_USAGE_TASK_FAILED", str(exc), request_id=request_id)
+    finally:
+        _release_openapi_concurrency(guard, concurrency)
+
+
 @router.post("/openapi/v1/ingestion/upload", status_code=202)
 async def openapi_ingestion_upload(
     request: Request,
@@ -709,12 +1146,15 @@ async def openapi_ingestion_upload(
             identity=identity,
             source_type=SOURCE_TYPE_FILE,
             source_summary=file.filename,
+            api_key_id=guard.api_key_id,
+            app_id=guard.app_id,
         )
         task = get_task(task_id)
         if task is not None:
             task["openapi"] = {
                 "request_id": request_id,
                 "api_key_id": guard.api_key_id,
+                "app_id": guard.app_id,
                 "parser_provider_requested": parser_provider or "",
                 "prompt_policy": prompt_policy,
             }
@@ -813,6 +1253,8 @@ async def openapi_ingestion_webpage(
             source_summary=payload.url,
             source_url=payload.url,
             source_options=payload.model_dump(),
+            api_key_id=guard.api_key_id,
+            app_id=guard.app_id,
         )
         background_tasks.add_task(run_pipeline_real, task_id)
         return JSONResponse(
@@ -905,6 +1347,8 @@ async def openapi_ingestion_backup_csv(
             source_summary=file.filename,
             fast_import=True,
             skipped_stages=SKIPPED_FAST_IMPORT_STAGES,
+            api_key_id=guard.api_key_id,
+            app_id=guard.app_id,
         )
         background_tasks.add_task(run_pipeline_real, task_id)
         return JSONResponse(
@@ -1090,6 +1534,7 @@ def _guard_openapi_call(
     client_ip: str | None = None,
     force_signature: bool = False,
 ) -> JSONResponse | ApiKeyAuthResult | None:
+    """验证 OpenAPI 调用权限"""
     if not (kb_id or "").strip():
         return _error_response(400, "KB_ID_REQUIRED", "kb_id is required for OpenAPI calls", request_id=request_id)
     capabilities = (capability,) if isinstance(capability, str) else tuple(capability)
@@ -1141,6 +1586,7 @@ def _guard_openapi_capability(
     client_ip: str | None = None,
     force_signature: bool = False,
 ) -> JSONResponse | ApiKeyAuthResult:
+    """验证 OpenAPI 能力权限"""
     api_key = _extract_api_key(authorization, x_api_key)
     if not api_key:
         return _error_response(
@@ -1179,6 +1625,7 @@ def _openapi_kb_binding_denied(
     signature: ApiKeySignaturePayload | None,
     client_ip: str | None,
 ) -> JSONResponse:
+    """返回知识库绑定校验失败的错误响应"""
     exc = ApiKeyError(
         "KB_BINDING_DENIED",
         "API Key is not bound to this knowledge base",
@@ -1309,6 +1756,7 @@ def _release_openapi_concurrency(auth_result: ApiKeyAuthResult | None, acquired:
 
 
 def _extract_api_key(authorization: str | None, x_api_key: str | None) -> str:
+    """从请求头提取 API Key"""
     header_key = (x_api_key or "").strip()
     if header_key:
         return header_key
@@ -1327,6 +1775,7 @@ def _signature_payload(
     body_sha256: str | None,
     signature: str | None,
 ) -> ApiKeySignaturePayload:
+    """构建签名验证载荷"""
     raw_query = str(request.url.query or "")
     path = request.url.path
     path_with_query = f"{path}?{raw_query}" if raw_query else path
@@ -1344,6 +1793,7 @@ def _signature_payload(
 
 
 def _client_ip(request: Request, x_forwarded_for: str | None) -> str:
+    """获取客户端真实 IP"""
     forwarded = (x_forwarded_for or "").strip()
     if forwarded:
         return forwarded.split(",", 1)[0].strip()
@@ -1351,6 +1801,7 @@ def _client_ip(request: Request, x_forwarded_for: str | None) -> str:
 
 
 def _api_key_status(code: str) -> int:
+    """根据错误码返回 HTTP 状态码"""
     if code in {"API_KEY_REQUIRED", "INVALID_API_KEY", "API_KEY_DISABLED", "API_KEY_EXPIRED"}:
         return 401
     if code in {"KB_BINDING_DENIED", "CAPABILITY_DENIED"}:
@@ -1379,6 +1830,7 @@ def _audit_openapi_denied(
     signature: ApiKeySignaturePayload | None,
     client_ip: str | None,
 ) -> None:
+    """记录 OpenAPI 拒绝访问审计日志"""
     append_audit_log(
         AuditLogRecord(
             action="openapi.auth_denied",
@@ -1409,6 +1861,7 @@ def _audit_openapi_denied(
 
 
 def _openapi_denied_risk(code: str) -> str:
+    """根据错误码评估风险等级"""
     if code in {
         "INVALID_SIGNATURE",
         "BODY_HASH_MISMATCH",
@@ -1432,6 +1885,7 @@ def _openapi_denied_risk(code: str) -> str:
 
 
 def _mask_client_ip(value: str | None) -> str:
+    """脱敏客户端 IP 地址"""
     ip = (value or "").split(",", 1)[0].strip()
     if not ip:
         return ""
@@ -1445,6 +1899,7 @@ def _mask_client_ip(value: str | None) -> str:
 
 
 def _strategy_label(value: str) -> str:
+    """获取切片策略的中文标签"""
     labels = {
         "paragraph": "段落切片",
         "fixed_length": "固定长度",
@@ -1457,6 +1912,7 @@ def _strategy_label(value: str) -> str:
 
 
 def _parser_provider_availability(provider: str) -> tuple[bool, str]:
+    """检查解析器提供者的可用性"""
     import os
 
     required_env = {
@@ -1471,6 +1927,7 @@ def _parser_provider_availability(provider: str) -> tuple[bool, str]:
 
 
 def _normalize_option(value: str | None, allowed: set[str], fallback: str) -> str:
+    """标准化选项值，无效值返回默认值"""
     normalized = (value or "").strip().lower()
     return normalized if normalized in allowed else fallback
 
@@ -1483,6 +1940,7 @@ def _validate_prompt_overrides(
     quality_prompt_content: str | None,
     capabilities: tuple[str, ...],
 ) -> tuple[dict, str | None]:
+    """验证提示词覆盖权限"""
     policy = {
         "cleaning": "system_default",
         "quality": "system_default",
@@ -1503,6 +1961,7 @@ def _validate_prompt_overrides(
 
 
 def _request_id() -> str:
+    """生成请求 ID"""
     return str(uuid.uuid4())
 
 
@@ -1514,6 +1973,7 @@ def _error_response(
     request_id: str | None = None,
     details: dict | None = None,
 ) -> JSONResponse:
+    """构建错误响应"""
     payload = {
         "requestId": request_id or _request_id(),
         "error": {
@@ -1526,6 +1986,7 @@ def _error_response(
 
 
 def _json_safe_error_value(value: object) -> object:
+    """将错误值转换为 JSON 安全格式"""
     if isinstance(value, bytes):
         return "<redacted bytes>"
     if isinstance(value, bytearray):
@@ -1545,6 +2006,7 @@ def _json_safe_error_value(value: object) -> object:
 
 
 def validation_error_response(exc_errors: list[dict]) -> JSONResponse:
+    """构建验证错误响应"""
     return _error_response(
         status_code=422,
         code="VALIDATION_ERROR",
